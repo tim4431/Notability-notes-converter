@@ -8,15 +8,16 @@ use super::util::{page_count_for, parse_line_spacing_doc};
 use crate::pdf::{add_form_xobject, page_box, page_id_by_index};
 use crate::Result;
 use flate2::{write::ZlibEncoder, Compression};
+use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageFormat};
+use image::{AnimationDecoder, DynamicImage, ExtendedColorType, GenericImageView, ImageFormat};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -186,8 +187,11 @@ fn write_page(
     let mut ext_cache: BTreeMap<(u16, bool), String> = BTreeMap::new();
     let doc_to_pt = note.export_width_pt / note.page_width_doc;
     let content_inset_doc = note.page_width_doc * DEFAULT_CONTENT_INSET_RATIO;
-    let line_spacing_doc =
-        parse_line_spacing_doc(note.line_style.as_deref(), note.page_width_doc, note.export_width_pt);
+    let line_spacing_doc = parse_line_spacing_doc(
+        note.line_style.as_deref(),
+        note.page_width_doc,
+        note.layout_width_pt,
+    );
     let pdf_page = note.pdf_pages.iter().find(|page| page.page_index == page_index);
     if let Some(pdf_page) = pdf_page {
         if let Some(base_doc) = loaded_pdfs.get(&pdf_page.relative_path) {
@@ -467,7 +471,7 @@ fn draw_pdf_sticky_note(
             ),
             Operation::new("w", vec![0.35.into()]),
         ]);
-        let mut line_y = spacing_pt * 1.5;
+        let mut line_y = spacing_pt * sticky.line_start_multiple;
         while line_y < height - spacing_pt * 0.25 {
             let py = height * 0.5 - line_y;
             operations.extend([
@@ -733,8 +737,15 @@ fn pdf_font_resource(style: &TextStyle) -> &'static str {
     } else {
         "helvetica"
     };
-    let bold = style.bold || lower.contains("impact") || lower.contains("chalkduster");
-    match (family, bold, style.italic) {
+    let bold = style.bold
+        || lower.contains("bold")
+        || lower.contains("black")
+        || lower.contains("demi")
+        || lower.contains("semibold")
+        || lower.contains("impact")
+        || lower.contains("chalkduster");
+    let italic = style.italic || lower.contains("italic") || lower.contains("oblique");
+    match (family, bold, italic) {
         ("times", true, true) => "FTimesBI",
         ("times", true, false) => "FTimesB",
         ("times", false, true) => "FTimesI",
@@ -1022,19 +1033,13 @@ fn add_image_xobject(
         return Ok(*image_id);
     }
     if is_jpeg {
-        if let Some((width, height)) = direct_jpeg_dimensions(&data, media) {
-            let image_id = output.add_object(Stream::new(
-                dictionary! {
-                    "Type" => "XObject",
-                    "Subtype" => "Image",
-                    "Width" => width as i64,
-                    "Height" => height as i64,
-                    "ColorSpace" => "DeviceRGB",
-                    "BitsPerComponent" => 8,
-                    "Filter" => "DCTDecode",
-                },
-                data,
-            ));
+        if let Some((width, height, 3)) = jpeg_dimensions(&data) {
+            let image_id = add_direct_jpeg(output, data, width, height);
+            let image_id = if let Some(transform) = jpeg_crop_transform(media.crop, width, height) {
+                add_cropped_image_form(output, image_id, transform)?
+            } else {
+                image_id
+            };
             image_cache.insert(cache_key, image_id);
             return Ok(image_id);
         }
@@ -1087,6 +1092,82 @@ fn add_image_xobject(
     Ok(image_id)
 }
 
+fn add_direct_jpeg(output: &mut Document, data: Vec<u8>, width: u16, height: u16) -> ObjectId {
+    output.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => width as i64,
+            "Height" => height as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+            "Filter" => "DCTDecode",
+        },
+        data,
+    ))
+}
+
+fn add_cropped_image_form(
+    output: &mut Document,
+    image_id: ObjectId,
+    transform: [f32; 6],
+) -> Result<ObjectId> {
+    let resources = dictionary! {
+        "XObject" => dictionary! {
+            "Image" => image_id,
+        },
+    };
+    let content = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new("re", vec![0.into(), 0.into(), 1.into(), 1.into()]),
+            Operation::new("W", vec![]),
+            Operation::new("n", vec![]),
+            Operation::new("cm", transform.into_iter().map(Into::into).collect()),
+            Operation::new("Do", vec!["Image".into()]),
+            Operation::new("Q", vec![]),
+        ],
+    };
+    Ok(output.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "FormType" => 1,
+            "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+            "Resources" => resources,
+        },
+        content.encode()?,
+    )))
+}
+
+fn jpeg_crop_transform(
+    crop: Option<super::model::ImageCrop>,
+    image_width: u16,
+    image_height: u16,
+) -> Option<[f32; 6]> {
+    let crop = crop?;
+    if crop_covers_image(Some(crop), image_width, image_height) {
+        return None;
+    }
+    let image_width = image_width as f32;
+    let image_height = image_height as f32;
+    let x = crop.x.clamp(0.0, image_width);
+    let y = crop.y.clamp(0.0, image_height);
+    let width = crop.width.min(image_width - x);
+    let height = crop.height.min(image_height - y);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some([
+        image_width / width,
+        0.0,
+        0.0,
+        image_height / height,
+        -x / width,
+        (y + height - image_height) / height,
+    ])
+}
+
 fn image_cache_key(
     data: &[u8],
     media: &super::model::MediaImage,
@@ -1116,17 +1197,6 @@ fn is_jpeg_path(path: &str) -> bool {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg")
         })
-}
-
-fn direct_jpeg_dimensions(data: &[u8], media: &super::model::MediaImage) -> Option<(u16, u16)> {
-    let (width, height, components) = jpeg_dimensions(data)?;
-    if components != 3 {
-        return None;
-    }
-    if !crop_covers_image(media.crop, width, height) {
-        return None;
-    }
-    Some((width, height))
 }
 
 fn crop_covers_image(
@@ -1189,7 +1259,17 @@ fn is_jpeg_sof_marker(marker: u8) -> bool {
 }
 
 fn load_media_image(data: &[u8], media: &super::model::MediaImage) -> Result<DynamicImage> {
-    let image = image::load_from_memory(data)?;
+    let image = if media.relative_path.to_ascii_lowercase().ends_with(".gif") {
+        let decoder = GifDecoder::new(Cursor::new(data))?;
+        let frame = decoder
+            .into_frames()
+            .next()
+            .transpose()?
+            .ok_or("GIF contains no frames")?;
+        DynamicImage::ImageRgba8(frame.into_buffer())
+    } else {
+        image::load_from_memory(data)?
+    };
     let Some(crop) = media.crop else {
         return Ok(image);
     };
@@ -1464,10 +1544,32 @@ fn draw_pencil_curve(
     content_inset_doc: f32,
     page_height: f32,
 ) {
-    if curve.points.len() < 2 {
+    if curve.points.is_empty() {
         return;
     }
     let points = stroke_points_pt(curve, doc_to_pt, content_inset_doc, page_height);
+    if points.len() == 1 {
+        let pressure = curve.pressures.first().copied().unwrap_or(1.0);
+        let frac = curve.fractional_widths.first().copied().unwrap_or(1.0);
+        let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
+        let alpha = pencil_alpha(curve.rgba[3], pressure);
+        let gs = ext_gstate_name(output, ext_gstates, ext_cache, alpha, false);
+        operations.extend([
+            Operation::new("q", vec![]),
+            Operation::new("gs", vec![gs.into()]),
+            Operation::new(
+                "rg",
+                vec![
+                    (curve.rgba[0] as f32 / 255.0).into(),
+                    (curve.rgba[1] as f32 / 255.0).into(),
+                    (curve.rgba[2] as f32 / 255.0).into(),
+                ],
+            ),
+        ]);
+        draw_circle(operations, points[0], width * 0.5);
+        operations.extend([Operation::new("f", vec![]), Operation::new("Q", vec![])]);
+        return;
+    }
     if is_bezier_point_count(points.len()) {
         let sample_count = ((points.len() - 1) / 3) + 1;
         let pressures = resample_values(&curve.pressures, sample_count);
@@ -1573,9 +1675,9 @@ fn push_pencil_stroke_state(
 
 fn dash_lengths(pattern: u8, style: u8, width: f32) -> (f32, f32) {
     match (pattern, style == STROKE_STYLE_HIGHLIGHTER) {
-        (1, true) => ((width * 2.0).max(2.0), (width * 2.1).max(1.8)),
+        (1, true) => ((width * 3.0).max(3.0), (width * 2.0).max(1.8)),
         (2, true) => ((width * 0.12).max(0.12), (width * 1.8).max(1.8)),
-        (1, false) => ((width * 0.12).max(0.12), (width * 2.1).max(1.2)),
+        (1, false) => ((width * 3.0).max(3.0), (width * 2.0).max(1.2)),
         (2, false) => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
         _ => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
     }
@@ -1866,8 +1968,11 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
     let total_height = note.export_height_pt * page_count as f32;
     let doc_to_pt = note.export_width_pt / note.page_width_doc;
     let content_inset_doc = note.page_width_doc * DEFAULT_CONTENT_INSET_RATIO;
-    let line_spacing_doc =
-        parse_line_spacing_doc(note.line_style.as_deref(), note.page_width_doc, note.export_width_pt);
+    let line_spacing_doc = parse_line_spacing_doc(
+        note.line_style.as_deref(),
+        note.page_width_doc,
+        note.layout_width_pt,
+    );
     let mut svg = String::new();
     write!(
         svg,
@@ -2364,7 +2469,7 @@ fn draw_svg_sticky_note(
             .and_then(|value| value.parse::<f32>().ok())
             .map(|inches| inches * 72.0)
             .unwrap_or(14.0);
-        let mut line_y = spacing * 1.5;
+        let mut line_y = spacing * sticky.line_start_multiple;
         while line_y < height - spacing * 0.25 {
             write!(
                 svg,
@@ -2408,6 +2513,11 @@ fn draw_svg_curves(
                 draw_svg_pen_curve(svg, curve, doc_to_pt, content_inset_doc, page_height)?;
             } else if curve.style == STROKE_STYLE_PENCIL {
                 draw_svg_pencil_curve(svg, curve, doc_to_pt, content_inset_doc)?;
+            } else if curve.style != STROKE_STYLE_HIGHLIGHTER
+                && curve.dash_pattern.is_none()
+                && curve_has_variable_width(curve)
+            {
+                draw_svg_pressure_pen_curve(svg, curve, doc_to_pt, content_inset_doc)?;
             } else {
                 draw_svg_pen_curve(svg, curve, doc_to_pt, content_inset_doc, page_height)?;
             }
@@ -2487,10 +2597,26 @@ fn draw_svg_pencil_curve(
     doc_to_pt: f32,
     content_inset_doc: f32,
 ) -> Result<()> {
-    if curve.points.len() < 2 {
+    if curve.points.is_empty() {
         return Ok(());
     }
     let points = stroke_points_svg(curve, doc_to_pt, content_inset_doc);
+    if points.len() == 1 {
+        let pressure = curve.pressures.first().copied().unwrap_or(1.0);
+        let frac = curve.fractional_widths.first().copied().unwrap_or(1.0);
+        let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
+        let alpha = pencil_alpha(curve.rgba[3], pressure);
+        write!(
+            svg,
+            "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\" />",
+            points[0].0,
+            points[0].1,
+            width * 0.5,
+            svg_rgb(curve.rgba),
+            alpha
+        )?;
+        return Ok(());
+    }
     if is_bezier_point_count(points.len()) {
         let sample_count = ((points.len() - 1) / 3) + 1;
         let pressures = resample_values(&curve.pressures, sample_count);
@@ -2545,6 +2671,79 @@ fn draw_svg_pencil_curve(
                 svg_rgb(curve.rgba),
                 alpha,
                 width.max(0.1)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn draw_svg_pressure_pen_curve(
+    svg: &mut String,
+    curve: &StrokeCurve,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+) -> Result<()> {
+    if curve.points.len() < 2 {
+        return draw_svg_pen_curve(svg, curve, doc_to_pt, content_inset_doc, f32::MAX);
+    }
+    let points = stroke_points_svg(curve, doc_to_pt, content_inset_doc);
+    let alpha = curve.rgba[3] as f32 / 255.0;
+    if is_bezier_point_count(points.len()) {
+        let sample_count = ((points.len() - 1) / 3) + 1;
+        let pressures = resample_values(&curve.pressures, sample_count);
+        let fracs = resample_values(&curve.fractional_widths, sample_count);
+        for segment_index in 0..((points.len() - 1) / 3) {
+            let width = pen_width(
+                curve.width * doc_to_pt,
+                (pressures[segment_index] + pressures[segment_index + 1]) * 0.5,
+                (fracs[segment_index] + fracs[segment_index + 1]) * 0.5,
+            );
+            let start = points[segment_index * 3];
+            let c1 = points[segment_index * 3 + 1];
+            let c2 = points[segment_index * 3 + 2];
+            let end = points[segment_index * 3 + 3];
+            write!(
+                svg,
+                concat!(
+                    "<path d=\"M {:.2} {:.2} C {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}\" ",
+                    "fill=\"none\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" ",
+                    "stroke-linecap=\"butt\" stroke-linejoin=\"round\" />"
+                ),
+                start.0,
+                start.1,
+                c1.0,
+                c1.1,
+                c2.0,
+                c2.1,
+                end.0,
+                end.1,
+                svg_rgb(curve.rgba),
+                alpha,
+                width
+            )?;
+        }
+    } else {
+        let pressures = resample_values(&curve.pressures, points.len());
+        let fracs = resample_values(&curve.fractional_widths, points.len());
+        for index in 0..points.len() - 1 {
+            let width = pen_width(
+                curve.width * doc_to_pt,
+                (pressures[index] + pressures[index + 1]) * 0.5,
+                (fracs[index] + fracs[index + 1]) * 0.5,
+            );
+            write!(
+                svg,
+                concat!(
+                    "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" ",
+                    "stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" stroke-linecap=\"butt\" />"
+                ),
+                points[index].0,
+                points[index].1,
+                points[index + 1].0,
+                points[index + 1].1,
+                svg_rgb(curve.rgba),
+                alpha,
+                width
             )?;
         }
     }
@@ -2678,6 +2877,8 @@ fn svg_text_decoration(style: &TextStyle) -> &'static str {
 fn media_mime_type(path: &str) -> &'static str {
     if path.to_ascii_lowercase().ends_with(".png") {
         "image/png"
+    } else if path.to_ascii_lowercase().ends_with(".gif") {
+        "image/gif"
     } else {
         "image/jpeg"
     }
@@ -2729,4 +2930,42 @@ fn base64_encode(data: &[u8]) -> String {
         _ => {}
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dash_lengths, jpeg_crop_transform};
+    use crate::converter::model::ImageCrop;
+
+    #[test]
+    fn dashed_lines_have_longer_marks_than_dotted_lines() {
+        let dashed = dash_lengths(1, 3, 2.0);
+        let dotted = dash_lengths(2, 3, 2.0);
+        assert!(dashed.0 > dotted.0);
+    }
+
+    #[test]
+    fn maps_a_jpeg_crop_into_a_clipped_unit_square() {
+        let crop = ImageCrop {
+            x: 10.0,
+            y: 20.0,
+            width: 50.0,
+            height: 40.0,
+        };
+        assert_eq!(
+            jpeg_crop_transform(Some(crop), 100, 80),
+            Some([2.0, 0.0, 0.0, 2.0, -0.2, -0.5])
+        );
+    }
+
+    #[test]
+    fn skips_clipping_for_a_full_jpeg_crop() {
+        let crop = ImageCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        assert_eq!(jpeg_crop_transform(Some(crop), 100, 80), None);
+    }
 }

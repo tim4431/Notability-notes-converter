@@ -44,7 +44,9 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
         .unwrap_or(679.0);
 
     let (line_style, paper_size, sizing_behavior) = parse_paper_attributes(&archive, session);
-    let export_width_pt = choose_export_width(paper_size.as_deref());
+    let layout_width_pt = choose_export_width(paper_size.as_deref());
+    let export_width_pt =
+        locked_export_width(sizing_behavior.as_deref()).unwrap_or(layout_width_pt);
     let pdf_pages = parse_pdf_pages(&archive, rich_text);
     let page_ratio = if sizing_behavior.as_deref() == Some("staticWidth")
         && paper_size
@@ -73,6 +75,7 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
         page_height_doc,
         export_width_pt,
         export_height_pt,
+        layout_width_pt,
         line_style,
         text,
         text_spans,
@@ -82,6 +85,19 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
         pdf_pages,
         curves,
     })
+}
+
+fn locked_export_width(sizing_behavior: Option<&str>) -> Option<f32> {
+    let behavior = sizing_behavior?;
+    let mut parts = behavior.split(':');
+    if parts.next()? != "lockedWidth" {
+        return None;
+    }
+    let width = parts.next()?.parse::<f32>().ok()?;
+    width
+        .is_finite()
+        .then_some(width)
+        .filter(|width| *width > 0.0)
 }
 
 pub(crate) fn read_zip_entry(bundle: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
@@ -487,6 +503,7 @@ fn parse_sticky_notes(
                 .unwrap_or(0.0),
             color,
             line_style,
+            line_start_multiple: 1.5,
             z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
         });
     }
@@ -1276,4 +1293,24 @@ fn unpack_i32(archive: Option<&KeyedArchive>, value: Option<&Value>) -> Vec<i32>
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locked_export_width;
+
+    #[test]
+    fn reads_locked_export_width() {
+        assert_eq!(
+            locked_export_width(Some("lockedWidth:679.0:iPad")),
+            Some(679.0)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_locked_export_width() {
+        assert_eq!(locked_export_width(Some("staticWidth")), None);
+        assert_eq!(locked_export_width(Some("lockedWidth:0:iPad")), None);
+        assert_eq!(locked_export_width(Some("lockedWidth:not-a-number:iPad")), None);
+    }
 }

@@ -24,7 +24,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextStyle {
     pub(crate) font_size: f32,
     pub(crate) font_name: String,
@@ -85,6 +85,7 @@ pub(crate) struct StickyNote {
     pub(crate) rotation_degrees: f32,
     pub(crate) color: [u8; 4],
     pub(crate) line_style: Option<String>,
+    pub(crate) line_start_multiple: f32,
     pub(crate) z_index: i64,
 }
 
@@ -125,6 +126,7 @@ pub(crate) struct NoteDocument {
     pub(crate) page_height_doc: f32,
     pub(crate) export_width_pt: f32,
     pub(crate) export_height_pt: f32,
+    pub(crate) layout_width_pt: f32,
     pub(crate) line_style: Option<String>,
     pub(crate) text: String,
     pub(crate) text_spans: Vec<TextSpan>,

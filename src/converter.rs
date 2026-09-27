@@ -2,6 +2,7 @@ mod archive;
 mod cli;
 mod model;
 mod note;
+mod ntb;
 mod render;
 mod util;
 

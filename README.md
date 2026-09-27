@@ -1,6 +1,6 @@
-# Notability `.note` Converter
+# Notability Notes Converter
 
-Converts `.note` files to `.pdf` by default, or optionally to `.svg`.
+Converts `.note` and `.ntb` files to `.pdf` by default, or optionally to `.svg`.
 
 I originally made this for personal use because I couldn't find a converter online. I hope it is useful to others as well.
 
@@ -8,15 +8,15 @@ Note: output is not perfectly identical to Notability’s official export. Some 
 
 ## Where is this useful?
 
-- Convert `.note` files to other formats in bulk (high speed is a plus)
-- View `.note` files on a machine that does not have Notability installed
-- Switch platforms by converting `.note` files to `.svg` (SVGs can be imported into other note-taking apps as editable files)
+- Convert `.note` and `.ntb` files to other formats in bulk (high speed is a plus)
+- View `.note` and `.ntb` files on a machine that does not have Notability installed
+- Switch platforms by converting notes to `.svg` (SVGs can be imported into other note-taking apps as editable files)
 
 ## How to use
 
 Requirement: [Rust](https://rust-lang.org/tools/install/)
 
-Put your exported `.note` files in `input/`, then run this from the repository root:
+Put your exported `.note` and `.ntb` files in `input/`, then run this from the repository root:
 
 ```bash
 cargo run
@@ -32,7 +32,7 @@ Example:
 ├── input/
 │   ├── example1.note
 │   └── example_folder/
-│       └── example2.note
+│       └── example2.ntb
 └── output/
     ├── example1.pdf
     └── example_folder/
@@ -143,3 +143,43 @@ Important limitations when converting:
 - raw partial erase behavior is only partly understood, but `partialshape` fragments preserve erased size for partially erased shapes/lines
 - highlighter dotted/dashed strokes can differ from Notability's exported PDF because the export may use filled fragments instead of native dash arrays
 - image rotation, crop, and horizontal/vertical flips are separate fields and all must be applied
+
+## Analysis of the `.ntb` file format
+
+A `.ntb` file is a more recent file format by Notability. It is also a ZIP archive, but its contents are different from a `.note` file. The main entries are:
+
+- `noteBundle`: a FlatBuffers event collection containing the note data
+- `assets/`: embedded media named with a SHA-512 content hash and a file extension
+
+The `noteBundle` stores a history of events instead of one final document object graph. Each event has an id, a type, and a payload. These event types are currently understood:
+
+- type 1: document and paper settings
+- type 8: text
+- type 12: character style ranges
+- type 13: paragraph and list style ranges
+- type 15: ink
+- type 18: shapes
+- type 20: lists of related event ids
+- type 22: images and sticky notes
+
+Text and style data are separate events. Character and paragraph styles contain ranges into the text event, so a converter needs to apply the style events to the matching characters.
+
+Ink paths use compact binary data with half-precision or single-precision values. The payload also stores the page, origin, scale, rotation, width, color, tool, and line style. The scale applies to both the path coordinates and the stroke width.
+
+Shapes are separate events. Lines can have a control point, polygons use point lists, and ellipses use a bounding size. Shape events also store page, origin, rotation, width, color, tool, and dash style.
+
+Transformed groups store rotation on each child event. Apply it to ink and shapes around each event origin. Line style 2 is dashed and line style 3 is dotted.
+
+Partial eraser and shape eraser results are stored as breaks inside an ink path. In cubic paths, command 0 continues the curve and command 3 moves to the next fragment. In linear paths, command 6 continues the line and command 7 moves to the next fragment. A move command must start a new path. Drawing a line across it fills the erased area again.
+
+Type 20 events contain lists of related event ids. They do not act as eraser masks, so their referenced ink and shapes should still be rendered.
+
+Images refer to files under `assets/` by their content hash. Their events store a MIME type, logical asset size, page, position, displayed size, rotation in radians, and an optional crop rectangle. Crop values use logical asset coordinates and do not always match the pixel dimensions of the stored image.
+
+The main differences from `.note` are:
+
+- `.note` uses an Apple keyed archive in `Session.plist`; `.ntb` uses FlatBuffers in `noteBundle`
+- `.note` mostly stores the current document state; `.ntb` stores an ordered event collection with event references
+- `.note` uses one continuous vertical coordinate space; `.ntb` events contain explicit page references
+- `.note` media uses paths under `Images/`; `.ntb` media uses content hashes under `assets/`
+- `.note` handwriting uses parallel binary arrays; `.ntb` stores a compact path inside each ink event

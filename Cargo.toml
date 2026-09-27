@@ -8,7 +8,7 @@ opt-level = 2
 
 [dependencies]
 flate2 = "1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png"] }
 lopdf = "0.35"
 plist = "1"
 serde = { version = "1", features = ["derive"] }

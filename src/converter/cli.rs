@@ -1,5 +1,5 @@
 use super::model::{OutputFormat, DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR};
-use super::{note, render};
+use super::{note, ntb, render};
 use crate::Result;
 use std::collections::BTreeMap;
 use std::fs;
@@ -88,14 +88,14 @@ fn mirror_folder(input: &Path, output: &Path, format: OutputFormat) -> Result<()
         let index = count + 1;
         let target = output_path_for_source(input, output, &source, format)?;
         let relative = source.strip_prefix(input)?;
-        if source
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("note"))
-        {
+        if is_note_source(&source) {
             print!("[{index}/{total}] Converting {} ... ", relative.display());
             io::stdout().flush()?;
-            let document = note::load_note_document(&source)?;
+            let document = if has_extension(&source, "ntb") {
+                ntb::load_ntb_document(&source)?
+            } else {
+                note::load_note_document(&source)?
+            };
             render::write_note_output(&document, &source, &target, format)?;
             println!("done");
         } else {
@@ -177,13 +177,19 @@ fn output_path_for_source(
     format: OutputFormat,
 ) -> Result<PathBuf> {
     let relative = source.strip_prefix(input)?;
-    if source
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("note"))
-    {
+    if is_note_source(source) {
         Ok(output.join(relative).with_extension(format.extension()))
     } else {
         Ok(output.join(relative))
     }
+}
+
+fn is_note_source(path: &Path) -> bool {
+    has_extension(path, "note") || has_extension(path, "ntb")
+}
+
+fn has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
