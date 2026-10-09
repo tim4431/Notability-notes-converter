@@ -4,8 +4,12 @@ use crate::Result;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) fn run(args: Vec<String>) -> Result<()> {
     let options = parse_args(&args)?;
@@ -14,7 +18,7 @@ pub(crate) fn run(args: Vec<String>) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_INPUT_DIR));
     if !input.exists() {
         fs::create_dir_all(&input)?;
-        println!("Created input; add .note files there, then run again.");
+        println!("Created input; add .note or .ntb files there, then run again.");
         return Ok(());
     }
     if !input.is_dir() {
@@ -67,14 +71,28 @@ fn usage_error() -> Box<dyn std::error::Error> {
 }
 
 fn mirror_folder(input: &Path, output: &Path, format: OutputFormat) -> Result<()> {
-    prepare_output_dir(input, output)?;
-    let files = source_files(input)?;
-    validate_collisions(input, output, &files, format)?;
+    let input = input.canonicalize()?;
+    let output = validate_output_dir(&input, output)?;
+    let files = source_files(&input)?;
+    validate_collisions(&input, &output, &files, format)?;
+    let mut staging = OwnedDirectory::beside(&output, "staging")?;
+    let count = mirror_into(&input, &staging.path, files, format)?;
+    let backup = publish_output(&mut staging, &output)?;
+    println!("Mirrored {count} file(s) to {}", output.display());
+    if let Some(backup) = backup {
+        println!("Previous output kept at {}", backup.display());
+    }
+    Ok(())
+}
 
-    for entry in WalkDir::new(input)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-    {
+fn mirror_into(
+    input: &Path,
+    output: &Path,
+    files: Vec<PathBuf>,
+    format: OutputFormat,
+) -> Result<usize> {
+    for entry in WalkDir::new(input) {
+        let entry = entry?;
         if entry.file_type().is_dir() {
             let relative = entry.path().strip_prefix(input)?;
             fs::create_dir_all(output.join(relative))?;
@@ -109,31 +127,130 @@ fn mirror_folder(input: &Path, output: &Path, format: OutputFormat) -> Result<()
         }
         count += 1;
     }
-    println!("Mirrored {count} file(s) to {}", output.display());
-    Ok(())
+    Ok(count)
 }
 
-fn prepare_output_dir(input: &Path, output: &Path) -> Result<()> {
-    let input = input.canonicalize()?;
-    if output.exists() {
-        let output_canon = output.canonicalize()?;
-        if input == output_canon {
-            return Err("Output folder must be different from input folder".into());
-        }
-        if input.starts_with(&output_canon) {
-            return Err("Output folder must not contain the input folder".into());
-        }
-        if !output.is_dir() {
-            return Err(format!(
-                "Output path exists and is not a folder: {}",
-                output.display()
-            )
-            .into());
-        }
-        fs::remove_dir_all(output)?;
+fn validate_output_dir(input: &Path, output: &Path) -> Result<PathBuf> {
+    let output = resolve_destination(output)?;
+    if input == output {
+        return Err("Output folder must be different from input folder".into());
     }
-    fs::create_dir_all(output)?;
-    Ok(())
+    if input.starts_with(&output) {
+        return Err("Output folder must not contain the input folder".into());
+    }
+    if output.starts_with(input) {
+        return Err("Output folder must not be inside the input folder".into());
+    }
+    if output.exists() && !output.is_dir() {
+        return Err(format!(
+            "Output path exists and is not a folder: {}",
+            output.display()
+        )
+        .into());
+    }
+    Ok(output)
+}
+
+// Resolve existing symlinks as we walk, including before handling `..`.
+// The final directory need not exist yet.
+fn resolve_destination(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        resolved = resolved.canonicalize()?;
+                    }
+                    Ok(metadata) if metadata.is_dir() => {
+                        resolved = resolved.canonicalize()?;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    Ok(resolved)
+}
+
+struct OwnedDirectory {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl OwnedDirectory {
+    fn beside(output: &Path, label: &str) -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = output.parent().ok_or("Output folder has no parent")?;
+        fs::create_dir_all(parent)?;
+        let name = output
+            .file_name()
+            .ok_or("Output folder has no name")?
+            .to_string_lossy()
+            .chars()
+            .take(32)
+            .collect::<String>();
+        loop {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".{name}.{label}-{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        cleanup: true,
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for OwnedDirectory {
+    fn drop(&mut self) {
+        if self.cleanup {
+            // Only directories successfully created by this instance are removed.
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn publish_output(staging: &mut OwnedDirectory, output: &Path) -> Result<Option<PathBuf>> {
+    let backup = if output.exists() {
+        let mut directory = OwnedDirectory::beside(output, "backup")?;
+        let previous = directory.path.join("previous");
+        fs::rename(output, &previous)?;
+        // Once it holds previous output, never automatically delete the backup.
+        directory.cleanup = false;
+        Some((directory.path.clone(), previous))
+    } else {
+        None
+    };
+    if let Err(error) = fs::rename(&staging.path, output) {
+        if let Some((directory, previous)) = &backup {
+            if let Err(rollback) = fs::rename(previous, output) {
+                return Err(format!("Could not publish output: {error}. Could not restore previous output: {rollback}. Previous output is at {}", previous.display()).into());
+            }
+            let _ = fs::remove_dir(directory);
+        }
+        return Err(error.into());
+    }
+    staging.cleanup = false;
+    Ok(backup.map(|(_, previous)| previous))
 }
 
 fn source_files(input: &Path) -> Result<Vec<PathBuf>> {

@@ -55,6 +55,7 @@ pub(crate) struct TextBlock {
     pub(crate) y: f32,
     pub(crate) width: f32,
     pub(crate) height: f32,
+    pub(crate) rotation_degrees: f32,
     pub(crate) text: String,
     pub(crate) text_spans: Vec<TextSpan>,
     pub(crate) z_index: i64,
@@ -110,6 +111,8 @@ pub(crate) struct StrokeCurve {
     pub(crate) dash_pattern: Option<u8>,
     pub(crate) pressures: Vec<f32>,
     pub(crate) fractional_widths: Vec<f32>,
+    /// NTB opacity per path segment. Empty for legacy strokes without this data.
+    pub(crate) opacities: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]

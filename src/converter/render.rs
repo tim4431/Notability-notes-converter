@@ -1,11 +1,11 @@
 use super::model::{
-    MediaImage, NoteDocument, OutputFormat, StickyNote, StrokeCurve, TextStyle,
+    MediaImage, NoteDocument, OutputFormat, StickyNote, StrokeCurve, TextBlock, TextStyle,
     CURVE_SMOOTHING_TENSION, DEFAULT_CONTENT_INSET_RATIO, DEFAULT_TEXT_TOP_DOC,
     STROKE_STYLE_HIGHLIGHTER, STROKE_STYLE_NOT_EXPORTED, STROKE_STYLE_PENCIL,
 };
 use super::note::read_zip_entry;
 use super::util::{page_count_for, parse_line_spacing_doc};
-use crate::pdf::{add_form_xobject, page_box, page_id_by_index};
+use crate::pdf::{add_form_xobject, page_box, page_id_by_index, page_render_transform};
 use crate::Result;
 use flate2::{write::ZlibEncoder, Compression};
 use image::codecs::gif::GifDecoder;
@@ -19,6 +19,7 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use zip::ZipArchive;
 
 pub(crate) fn write_note_output(
@@ -126,6 +127,35 @@ type ImageXObjectCache = BTreeMap<ImageCacheKey, ObjectId>;
 enum PageMedia<'a> {
     Image(&'a MediaImage),
     Sticky(&'a StickyNote),
+    Text(&'a TextBlock),
+}
+
+fn page_media_layers(note: &NoteDocument, page_index: usize) -> Vec<(i64, usize, PageMedia<'_>)> {
+    let mut layers = Vec::new();
+    for media in note
+        .media_images
+        .iter()
+        .filter(|m| m.page_index == page_index)
+    {
+        layers.push((media.z_index, layers.len(), PageMedia::Image(media)));
+    }
+    for sticky in note
+        .sticky_notes
+        .iter()
+        .filter(|m| m.page_index == page_index)
+    {
+        layers.push((sticky.z_index, layers.len(), PageMedia::Sticky(sticky)));
+    }
+    // Text follows a background with the same z-index, including sticky-note text.
+    for block in note
+        .text_blocks
+        .iter()
+        .filter(|m| m.page_index == page_index)
+    {
+        layers.push((block.z_index, layers.len(), PageMedia::Text(block)));
+    }
+    layers.sort_by_key(|(z, order, _)| (*z, *order));
+    layers
 }
 
 impl PdfFonts {
@@ -192,30 +222,26 @@ fn write_page(
         note.page_width_doc,
         note.layout_width_pt,
     );
-    let pdf_page = note.pdf_pages.iter().find(|page| page.page_index == page_index);
+    let pdf_page = note
+        .pdf_pages
+        .iter()
+        .find(|page| page.page_index == page_index);
     if let Some(pdf_page) = pdf_page {
         if let Some(base_doc) = loaded_pdfs.get(&pdf_page.relative_path) {
             let page_id = page_id_by_index(base_doc, pdf_page.source_page_index)?;
             let bbox = page_box(base_doc, page_id)?;
             let form_id = add_form_xobject(output, base_doc, page_id, bbox)?;
             xobjects.set("Base", form_id);
-            let width = bbox[2] - bbox[0];
-            let height = bbox[3] - bbox[1];
-            let sx = note.export_width_pt / width;
-            let sy = note.export_height_pt / height;
+            let transform = page_render_transform(
+                base_doc,
+                page_id,
+                bbox,
+                note.export_width_pt,
+                note.export_height_pt,
+            )?;
             operations.extend([
                 Operation::new("q", vec![]),
-                Operation::new(
-                    "cm",
-                    vec![
-                        sx.into(),
-                        0.into(),
-                        0.into(),
-                        sy.into(),
-                        (-bbox[0] * sx).into(),
-                        (-bbox[1] * sy).into(),
-                    ],
-                ),
+                Operation::new("cm", transform.into_iter().map(Into::into).collect()),
                 Operation::new("Do", vec!["Base".into()]),
                 Operation::new("Q", vec![]),
             ]);
@@ -230,17 +256,7 @@ fn write_page(
         );
     }
 
-    if page_index == 0 {
-        draw_text(
-            &mut operations,
-            note,
-            page_index,
-            doc_to_pt,
-            content_inset_doc,
-            line_spacing_doc,
-        );
-    }
-    draw_text_blocks(
+    draw_text(
         &mut operations,
         note,
         page_index,
@@ -248,28 +264,7 @@ fn write_page(
         content_inset_doc,
         line_spacing_doc,
     );
-    let mut media_layers = Vec::new();
-    for (image_index, media) in note
-        .media_images
-        .iter()
-        .filter(|media| media.page_index == page_index)
-        .enumerate()
-    {
-        media_layers.push((media.z_index, image_index, PageMedia::Image(media)));
-    }
-    for (sticky_index, sticky) in note
-        .sticky_notes
-        .iter()
-        .filter(|sticky| sticky.page_index == page_index)
-        .enumerate()
-    {
-        media_layers.push((
-            sticky.z_index,
-            note.media_images.len() + sticky_index,
-            PageMedia::Sticky(sticky),
-        ));
-    }
-    media_layers.sort_by_key(|(z_index, order, _)| (*z_index, *order));
+    let media_layers = page_media_layers(note, page_index);
     for (layer_index, (_, _, layer)) in media_layers.into_iter().enumerate() {
         match layer {
             PageMedia::Image(media) => draw_pdf_image(
@@ -290,6 +285,14 @@ fn write_page(
                 doc_to_pt,
                 content_inset_doc,
                 note.export_height_pt,
+            ),
+            PageMedia::Text(block) => draw_pdf_text_block(
+                &mut operations,
+                note,
+                block,
+                doc_to_pt,
+                content_inset_doc,
+                line_spacing_doc,
             ),
         }
     }
@@ -362,8 +365,16 @@ fn draw_pdf_image(
     let angle = -media.rotation_degrees.to_radians();
     let cos = angle.cos();
     let sin = angle.sin();
-    let image_scale_x = if media.flipped_horizontal { -width } else { width };
-    let image_scale_y = if media.flipped_vertical { -height } else { height };
+    let image_scale_x = if media.flipped_horizontal {
+        -width
+    } else {
+        width
+    };
+    let image_scale_y = if media.flipped_vertical {
+        -height
+    } else {
+        height
+    };
     let image_offset_x = if media.flipped_horizontal {
         width * 0.5
     } else {
@@ -378,11 +389,25 @@ fn draw_pdf_image(
         Operation::new("q", vec![]),
         Operation::new(
             "cm",
-            vec![1.into(), 0.into(), 0.into(), 1.into(), center_x.into(), center_y.into()],
+            vec![
+                1.into(),
+                0.into(),
+                0.into(),
+                1.into(),
+                center_x.into(),
+                center_y.into(),
+            ],
         ),
         Operation::new(
             "cm",
-            vec![cos.into(), sin.into(), (-sin).into(), cos.into(), 0.into(), 0.into()],
+            vec![
+                cos.into(),
+                sin.into(),
+                (-sin).into(),
+                cos.into(),
+                0.into(),
+                0.into(),
+            ],
         ),
         Operation::new(
             "cm",
@@ -422,11 +447,25 @@ fn draw_pdf_sticky_note(
         Operation::new("q", vec![]),
         Operation::new(
             "cm",
-            vec![1.into(), 0.into(), 0.into(), 1.into(), center_x.into(), center_y.into()],
+            vec![
+                1.into(),
+                0.into(),
+                0.into(),
+                1.into(),
+                center_x.into(),
+                center_y.into(),
+            ],
         ),
         Operation::new(
             "cm",
-            vec![cos.into(), sin.into(), (-sin).into(), cos.into(), 0.into(), 0.into()],
+            vec![
+                cos.into(),
+                sin.into(),
+                (-sin).into(),
+                cos.into(),
+                0.into(),
+                0.into(),
+            ],
         ),
         Operation::new(
             "rg",
@@ -497,12 +536,22 @@ fn draw_background(
         Operation::new("rg", vec![1.into(), 1.into(), 1.into()]),
         Operation::new(
             "re",
-            vec![0.into(), 0.into(), note.export_width_pt.into(), note.export_height_pt.into()],
+            vec![
+                0.into(),
+                0.into(),
+                note.export_width_pt.into(),
+                note.export_height_pt.into(),
+            ],
         ),
         Operation::new("f", vec![]),
         Operation::new("Q", vec![]),
     ]);
-    if !note.line_style.as_deref().unwrap_or("").starts_with("Lines") {
+    if !note
+        .line_style
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("Lines")
+    {
         return;
     }
     let margin = content_inset_doc * doc_to_pt;
@@ -555,31 +604,54 @@ fn draw_text(
     );
 }
 
-fn draw_text_blocks(
+fn draw_pdf_text_block(
     operations: &mut Vec<Operation>,
     note: &NoteDocument,
-    page_index: usize,
+    block: &TextBlock,
     doc_to_pt: f32,
     content_inset_doc: f32,
     line_spacing_doc: f32,
 ) {
-    for block in note.text_blocks.iter().filter(|block| block.page_index == page_index) {
-        let _block_height_doc = block.height;
-        draw_text_content(
-            operations,
-            &block.text,
-            &block.text_spans,
-            page_index,
-            note.page_height_doc,
-            note.export_height_pt,
-            block.x,
-            block.y,
-            block.width,
-            doc_to_pt,
-            content_inset_doc,
-            line_spacing_doc,
-        );
-    }
+    let page_index = block.page_index;
+    let x = (block.x + content_inset_doc) * doc_to_pt;
+    let y = note.export_height_pt - (block.y + block.height) * doc_to_pt;
+    let width = block.width * doc_to_pt;
+    let height = block.height * doc_to_pt;
+    let cx = x + width * 0.5;
+    let cy = y + height * 0.5;
+    let (sin, cos) = (-block.rotation_degrees.to_radians()).sin_cos();
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new(
+            "cm",
+            vec![
+                cos.into(),
+                sin.into(),
+                (-sin).into(),
+                cos.into(),
+                (cx - cos * cx + sin * cy).into(),
+                (cy - sin * cx - cos * cy).into(),
+            ],
+        ),
+        Operation::new("re", vec![x.into(), y.into(), width.into(), height.into()]),
+        Operation::new("W", vec![]),
+        Operation::new("n", vec![]),
+    ]);
+    draw_text_content(
+        operations,
+        &block.text,
+        &block.text_spans,
+        page_index,
+        note.page_height_doc,
+        note.export_height_pt,
+        block.x,
+        block.y + block.page_index as f32 * note.page_height_doc,
+        block.width,
+        doc_to_pt,
+        content_inset_doc,
+        line_spacing_doc,
+    );
+    operations.push(Operation::new("Q", vec![]));
 }
 
 fn draw_text_content(
@@ -612,18 +684,26 @@ fn draw_text_content(
             at_line_start = true;
             continue;
         }
-        let style = styles.get(char_index).cloned().unwrap_or_else(default_text_style);
-        line_height_doc = line_height_doc.max(style.font_size * style.line_spacing_multiplier.max(1.0));
+        let style = styles
+            .get(char_index)
+            .cloned()
+            .unwrap_or_else(default_text_style);
+        line_height_doc =
+            line_height_doc.max(style.font_size * style.line_spacing_multiplier.max(1.0));
         if at_line_start {
-            draw_pdf_list_marker(
-                operations,
-                &style,
-                origin_x_doc,
-                origin_y_doc + cursor_y_doc,
-                doc_to_pt,
-                content_inset_doc,
-                export_height_pt,
-            );
+            let absolute_y = origin_y_doc + cursor_y_doc;
+            let marker_page = (absolute_y / page_height_doc).floor() as usize;
+            if marker_page == target_page_index {
+                draw_pdf_list_marker(
+                    operations,
+                    &style,
+                    origin_x_doc,
+                    absolute_y - marker_page as f32 * page_height_doc,
+                    doc_to_pt,
+                    content_inset_doc,
+                    export_height_pt,
+                );
+            }
             cursor_x_doc += list_text_indent_doc(&style);
             at_line_start = false;
         }
@@ -720,6 +800,46 @@ fn text_line_advance_doc(line_spacing_doc: f32, line_height_doc: f32) -> f32 {
         .ceil()
         .max(1.0);
     line_spacing_doc * steps
+}
+
+pub(super) fn main_text_page_count(note: &NoteDocument) -> usize {
+    let spacing = parse_line_spacing_doc(
+        note.line_style.as_deref(),
+        note.page_width_doc,
+        note.layout_width_pt,
+    );
+    let max_width = note.page_width_doc * (1.0 - DEFAULT_CONTENT_INSET_RATIO * 2.0);
+    let styles = build_style_map_for(&note.text, &note.text_spans);
+    let (mut x, mut y, mut line_height) = (0.0f32, 0.0f32, 0.0f32);
+    let mut at_line_start = true;
+    let mut count = 1;
+    for (index, ch) in note.text.chars().enumerate() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            x = 0.0;
+            y += text_line_advance_doc(spacing, line_height);
+            line_height = 0.0;
+            at_line_start = true;
+            continue;
+        }
+        let style = &styles[index];
+        line_height = line_height.max(style.font_size * style.line_spacing_multiplier.max(1.0));
+        if at_line_start {
+            x += list_text_indent_doc(style);
+            at_line_start = false;
+        }
+        let width = style.font_size * font_width_factor(style, ch);
+        if x + width > max_width {
+            x = list_text_indent_doc(style);
+            y += text_line_advance_doc(spacing, line_height);
+            line_height = style.font_size * style.line_spacing_multiplier.max(1.0);
+        }
+        count = count.max(((DEFAULT_TEXT_TOP_DOC + y) / note.page_height_doc).floor() as usize + 1);
+        x += width;
+    }
+    count
 }
 
 fn pdf_font_resource(style: &TextStyle) -> &'static str {
@@ -821,7 +941,13 @@ fn draw_pdf_list_marker(
                     (style.color[2] as f32 / 255.0).into(),
                 ],
             ),
-            Operation::new("Tf", vec![pdf_font_resource(style).into(), (style.font_size * doc_to_pt).into()]),
+            Operation::new(
+                "Tf",
+                vec![
+                    pdf_font_resource(style).into(),
+                    (style.font_size * doc_to_pt).into(),
+                ],
+            ),
             Operation::new("Td", vec![x.into(), baseline_y.into()]),
             Operation::new("Tj", vec![Object::string_literal(marker)]),
             Operation::new("ET", vec![]),
@@ -1168,11 +1294,7 @@ fn jpeg_crop_transform(
     ])
 }
 
-fn image_cache_key(
-    data: &[u8],
-    media: &super::model::MediaImage,
-    is_jpeg: bool,
-) -> ImageCacheKey {
+fn image_cache_key(data: &[u8], media: &super::model::MediaImage, is_jpeg: bool) -> ImageCacheKey {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut hasher);
     ImageCacheKey {
@@ -1358,7 +1480,7 @@ fn draw_curves(
     }
 }
 
-fn curve_has_variable_width(curve: &StrokeCurve) -> bool {
+pub(super) fn curve_has_variable_width(curve: &StrokeCurve) -> bool {
     fn varies(values: &[f32]) -> bool {
         let Some(first) = values.first() else {
             return false;
@@ -1379,9 +1501,6 @@ fn draw_pen_curve(
     page_height: f32,
 ) {
     if curve.points.is_empty() {
-        return;
-    }
-    if is_spurious_dot(curve) {
         return;
     }
     if curve.fill_path {
@@ -1482,7 +1601,7 @@ fn draw_pressure_pen_curve(
         curve.rgba[3] as f32 / 255.0,
         false,
     );
-    if is_bezier_point_count(points.len()) {
+    if !curve.preserve_vertices && is_bezier_point_count(points.len()) {
         let sample_count = ((points.len() - 1) / 3) + 1;
         let pressures = resample_values(&curve.pressures, sample_count);
         let fracs = resample_values(&curve.fractional_widths, sample_count);
@@ -1526,7 +1645,10 @@ fn draw_pressure_pen_curve(
             push_pencil_stroke_state(operations, curve, width, &gs);
             operations.extend([
                 Operation::new("m", vec![points[index].0.into(), points[index].1.into()]),
-                Operation::new("l", vec![points[index + 1].0.into(), points[index + 1].1.into()]),
+                Operation::new(
+                    "l",
+                    vec![points[index + 1].0.into(), points[index + 1].1.into()],
+                ),
                 Operation::new("S", vec![]),
                 Operation::new("Q", vec![]),
             ]);
@@ -1552,7 +1674,7 @@ fn draw_pencil_curve(
         let pressure = curve.pressures.first().copied().unwrap_or(1.0);
         let frac = curve.fractional_widths.first().copied().unwrap_or(1.0);
         let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-        let alpha = pencil_alpha(curve.rgba[3], pressure);
+        let alpha = pencil_segment_alpha(curve, 0, pressure);
         let gs = ext_gstate_name(output, ext_gstates, ext_cache, alpha, false);
         operations.extend([
             Operation::new("q", vec![]),
@@ -1570,7 +1692,7 @@ fn draw_pencil_curve(
         operations.extend([Operation::new("f", vec![]), Operation::new("Q", vec![])]);
         return;
     }
-    if is_bezier_point_count(points.len()) {
+    if !curve.preserve_vertices && is_bezier_point_count(points.len()) {
         let sample_count = ((points.len() - 1) / 3) + 1;
         let pressures = resample_values(&curve.pressures, sample_count);
         let fracs = resample_values(&curve.fractional_widths, sample_count);
@@ -1578,7 +1700,7 @@ fn draw_pencil_curve(
             let pressure = (pressures[segment_index] + pressures[segment_index + 1]) / 2.0;
             let frac = (fracs[segment_index] + fracs[segment_index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha = pencil_alpha(curve.rgba[3], pressure);
+            let alpha = pencil_segment_alpha(curve, segment_index, pressure);
             let gs = ext_gstate_name(output, ext_gstates, ext_cache, alpha, false);
             push_stroke_state(operations, curve, width, &gs);
             let start = points[segment_index * 3];
@@ -1609,12 +1731,15 @@ fn draw_pencil_curve(
             let pressure = (pressures[index] + pressures[index + 1]) / 2.0;
             let frac = (fracs[index] + fracs[index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha = pencil_alpha(curve.rgba[3], pressure);
+            let alpha = pencil_segment_alpha(curve, index, pressure);
             let gs = ext_gstate_name(output, ext_gstates, ext_cache, alpha, false);
             push_stroke_state(operations, curve, width, &gs);
             operations.extend([
                 Operation::new("m", vec![points[index].0.into(), points[index].1.into()]),
-                Operation::new("l", vec![points[index + 1].0.into(), points[index + 1].1.into()]),
+                Operation::new(
+                    "l",
+                    vec![points[index + 1].0.into(), points[index + 1].1.into()],
+                ),
                 Operation::new("S", vec![]),
                 Operation::new("Q", vec![]),
             ]);
@@ -1622,12 +1747,7 @@ fn draw_pencil_curve(
     }
 }
 
-fn push_stroke_state(
-    operations: &mut Vec<Operation>,
-    curve: &StrokeCurve,
-    width: f32,
-    gs: &str,
-) {
+fn push_stroke_state(operations: &mut Vec<Operation>, curve: &StrokeCurve, width: f32, gs: &str) {
     operations.extend([
         Operation::new("q", vec![]),
         Operation::new("gs", vec![gs.into()]),
@@ -1698,19 +1818,11 @@ fn curve_path_extent(curve: &StrokeCurve) -> f32 {
     (max_x - min_x).hypot(max_y - min_y)
 }
 
-fn is_spurious_dot(curve: &StrokeCurve) -> bool {
-    let is_dark = curve.rgba[0] < 48 && curve.rgba[1] < 48 && curve.rgba[2] < 48;
-    is_dark
-        && curve.style != STROKE_STYLE_HIGHLIGHTER
-        && curve.width <= 0.75
-        && curve.dash_pattern.is_none()
-        && (curve.points.len() == 1
-            || curve_path_extent(curve) <= curve.width * 2.5
-            || (curve.fill_path && curve_path_extent(curve) <= 25.0))
-}
-
 fn draw_path(operations: &mut Vec<Operation>, curve: &StrokeCurve, points: &[(f32, f32)]) {
-    operations.push(Operation::new("m", vec![points[0].0.into(), points[0].1.into()]));
+    operations.push(Operation::new(
+        "m",
+        vec![points[0].0.into(), points[0].1.into()],
+    ));
     if curve.preserve_vertices || points.len() == 2 {
         for point in points.iter().skip(1) {
             operations.push(Operation::new("l", vec![point.0.into(), point.1.into()]));
@@ -1775,9 +1887,11 @@ fn draw_encoded_path(
                 index += 1;
             }
             3 => {
-                let (Some(c1), Some(c2), Some(end)) =
-                    (points.get(index), points.get(index + 1), points.get(index + 2))
-                else {
+                let (Some(c1), Some(c2), Some(end)) = (
+                    points.get(index),
+                    points.get(index + 1),
+                    points.get(index + 2),
+                ) else {
                     return false;
                 };
                 operations.push(Operation::new(
@@ -1799,17 +1913,27 @@ fn draw_encoded_path(
     index == points.len()
 }
 
-fn smoothed_cubic_segments(points: &[(f32, f32)]) -> Vec<((f32, f32), (f32, f32), (f32, f32))> {
+pub(super) fn smoothed_cubic_segments(
+    points: &[(f32, f32)],
+) -> Vec<((f32, f32), (f32, f32), (f32, f32))> {
     if points.len() < 3 {
         return Vec::new();
     }
     let scale = CURVE_SMOOTHING_TENSION / 6.0;
     let mut segments = Vec::with_capacity(points.len() - 1);
     for index in 0..points.len() - 1 {
-        let p0 = if index > 0 { points[index - 1] } else { points[index] };
+        let p0 = if index > 0 {
+            points[index - 1]
+        } else {
+            points[index]
+        };
         let p1 = points[index];
         let p2 = points[index + 1];
-        let p3 = if index + 2 < points.len() { points[index + 2] } else { p2 };
+        let p3 = if index + 2 < points.len() {
+            points[index + 2]
+        } else {
+            p2
+        };
         let c1 = (p1.0 + (p2.0 - p0.0) * scale, p1.1 + (p2.1 - p0.1) * scale);
         let c2 = (p2.0 - (p3.0 - p1.0) * scale, p2.1 - (p3.1 - p1.1) * scale);
         segments.push((c1, c2, p2));
@@ -1904,11 +2028,16 @@ fn stroke_points_pt(
     curve
         .points
         .iter()
-        .map(|(x, y)| ((x + content_inset_doc) * doc_to_pt, page_height - y * doc_to_pt))
+        .map(|(x, y)| {
+            (
+                (x + content_inset_doc) * doc_to_pt,
+                page_height - y * doc_to_pt,
+            )
+        })
         .collect()
 }
 
-fn pencil_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
+pub(super) fn pencil_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
     let pressure = pressure.clamp(0.05, 2.5);
     let frac = frac.clamp(0.15, 3.0);
     (base_width * frac * (0.38 + 0.30 * pressure.sqrt())).max(0.1)
@@ -1919,7 +2048,14 @@ fn pencil_alpha(raw_alpha: u8, pressure: f32) -> f32 {
     (raw_alpha as f32 / 255.0) * (0.08 + 0.18 * pressure).clamp(0.08, 0.55)
 }
 
-fn pen_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
+fn pencil_segment_alpha(curve: &StrokeCurve, index: usize, pressure: f32) -> f32 {
+    curve.opacities.get(index).map_or_else(
+        || pencil_alpha(curve.rgba[3], pressure),
+        |opacity| curve.rgba[3] as f32 / 255.0 * opacity.clamp(0.0, 1.0),
+    )
+}
+
+pub(super) fn pen_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
     let pressure = pressure.clamp(0.2, 2.5);
     let frac = frac.clamp(0.2, 3.0);
     (base_width * frac * pressure.sqrt()).max(0.1)
@@ -1974,6 +2110,16 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
         note.layout_width_pt,
     );
     let mut svg = String::new();
+    let mut pdf_assets = BTreeMap::new();
+    for page in &note.pdf_pages {
+        if !pdf_assets.contains_key(&page.relative_path) {
+            let data = read_zip_entry(
+                &mut bundle,
+                &(note.bundle_root.clone() + &page.relative_path),
+            )?;
+            pdf_assets.insert(page.relative_path.clone(), data);
+        }
+    }
     write!(
         svg,
         concat!(
@@ -1981,21 +2127,22 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{:.2}\" height=\"{:.2}\" ",
             "viewBox=\"0 0 {:.2} {:.2}\">"
         ),
-        note.export_width_pt,
-        total_height,
-        note.export_width_pt,
-        total_height
+        note.export_width_pt, total_height, note.export_width_pt, total_height
     )?;
-    if !note.pdf_pages.is_empty() {
-        svg.push_str("<!-- Imported PDF base pages are not rendered in SVG output. -->");
-    }
     for page_index in 0..page_count {
         let page_origin_y = page_index as f32 * note.export_height_pt;
         write!(
             svg,
-            "<g id=\"page-{}\" transform=\"translate(0,{:.2})\">",
+            concat!(
+                "<defs><clipPath id=\"page-clip-{}\"><rect width=\"{:.2}\" height=\"{:.2}\"/></clipPath></defs>",
+                "<g id=\"page-{}\" transform=\"translate(0,{:.2})\" clip-path=\"url(#page-clip-{})\">"
+            ),
             page_index + 1,
-            page_origin_y
+            note.export_width_pt,
+            note.export_height_pt,
+            page_index + 1,
+            page_origin_y,
+            page_index + 1,
         )?;
         draw_svg_background(
             &mut svg,
@@ -2005,6 +2152,19 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
             content_inset_doc,
             line_spacing_doc,
         )?;
+        if let Some(page) = note
+            .pdf_pages
+            .iter()
+            .find(|page| page.page_index == page_index)
+        {
+            draw_svg_pdf_background(
+                &mut svg,
+                &pdf_assets[&page.relative_path],
+                page.source_page_index,
+                note.export_width_pt,
+                note.export_height_pt,
+            )?;
+        }
         draw_svg_text(
             &mut svg,
             note,
@@ -2013,15 +2173,14 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
             content_inset_doc,
             line_spacing_doc,
         )?;
-        draw_svg_text_blocks(
+        draw_svg_images(
             &mut svg,
+            &mut bundle,
             note,
             page_index,
             doc_to_pt,
             content_inset_doc,
-            line_spacing_doc,
         )?;
-        draw_svg_images(&mut svg, &mut bundle, note, page_index, doc_to_pt, content_inset_doc)?;
         draw_svg_curves(
             &mut svg,
             note,
@@ -2037,6 +2196,59 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
     Ok(())
 }
 
+fn draw_svg_pdf_background(
+    svg: &mut String,
+    pdf: &[u8],
+    page_index: usize,
+    width: f32,
+    height: f32,
+) -> Result<()> {
+    // SVG cannot embed a PDF page as an image. Rasterize only its background;
+    // handwritten paths and note annotations remain SVG elements.
+    let page = (page_index + 1).to_string();
+    let mut child = Command::new("pdftoppm")
+        .args([
+            "-f",
+            &page,
+            "-l",
+            &page,
+            "-r",
+            "144",
+            "-cropbox",
+            "-png",
+            "-singlefile",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("SVG PDF backgrounds require Poppler's pdftoppm: {error}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or("Could not open PDF renderer input")?
+        .write_all(pdf);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.into());
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() || !output.stdout.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(format!(
+            "Could not render PDF background page {}: {}",
+            page_index + 1,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    write!(svg,
+        "<image x=\"0\" y=\"0\" width=\"{width:.2}\" height=\"{height:.2}\" href=\"data:image/png;base64,{}\" preserveAspectRatio=\"none\"/>",
+        base64_encode(&output.stdout))?;
+    Ok(())
+}
+
 fn draw_svg_background(
     svg: &mut String,
     note: &NoteDocument,
@@ -2048,13 +2260,21 @@ fn draw_svg_background(
     write!(
         svg,
         "<rect x=\"0\" y=\"0\" width=\"{:.2}\" height=\"{:.2}\" fill=\"#ffffff\"/>",
-        note.export_width_pt,
-        note.export_height_pt
+        note.export_width_pt, note.export_height_pt
     )?;
-    if note.pdf_pages.iter().any(|page| page.page_index == page_index) {
+    if note
+        .pdf_pages
+        .iter()
+        .any(|page| page.page_index == page_index)
+    {
         return Ok(());
     }
-    if !note.line_style.as_deref().unwrap_or("").starts_with("Lines") {
+    if !note
+        .line_style
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("Lines")
+    {
         return Ok(());
     }
     let margin = content_inset_doc * doc_to_pt;
@@ -2099,30 +2319,40 @@ fn draw_svg_text(
     )
 }
 
-fn draw_svg_text_blocks(
+fn draw_svg_text_block(
     svg: &mut String,
     note: &NoteDocument,
-    page_index: usize,
+    block: &TextBlock,
+    index: usize,
     doc_to_pt: f32,
     content_inset_doc: f32,
     line_spacing_doc: f32,
 ) -> Result<()> {
-    for block in note.text_blocks.iter().filter(|block| block.page_index == page_index) {
-        let _block_height_doc = block.height;
-        draw_svg_text_content(
-            svg,
-            note,
-            page_index,
-            &block.text,
-            &block.text_spans,
-            block.x,
-            block.y,
-            block.width,
-            doc_to_pt,
-            content_inset_doc,
-            line_spacing_doc,
-        )?;
-    }
+    let page_index = block.page_index;
+    let x = (content_inset_doc + block.x) * doc_to_pt;
+    let y = block.y * doc_to_pt;
+    let width = block.width * doc_to_pt;
+    let height = block.height * doc_to_pt;
+    write!(svg, concat!(
+            "<g transform=\"rotate({:.4} {:.2} {:.2})\"><defs>",
+            "<clipPath id=\"text-clip-{}-{}\"><rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\"/>",
+            "</clipPath></defs><g clip-path=\"url(#text-clip-{}-{})\">"
+        ), block.rotation_degrees, x + width * 0.5, y + height * 0.5,
+            page_index, index, x, y, width, height, page_index, index)?;
+    draw_svg_text_content(
+        svg,
+        note,
+        page_index,
+        &block.text,
+        &block.text_spans,
+        block.x,
+        block.y + block.page_index as f32 * note.page_height_doc,
+        block.width,
+        doc_to_pt,
+        content_inset_doc,
+        line_spacing_doc,
+    )?;
+    svg.push_str("</g></g>");
     Ok(())
 }
 
@@ -2155,8 +2385,12 @@ fn draw_svg_text_content(
             at_line_start = true;
             continue;
         }
-        let style = styles.get(char_index).cloned().unwrap_or_else(default_text_style);
-        line_height_doc = line_height_doc.max(style.font_size * style.line_spacing_multiplier.max(1.0));
+        let style = styles
+            .get(char_index)
+            .cloned()
+            .unwrap_or_else(default_text_style);
+        line_height_doc =
+            line_height_doc.max(style.font_size * style.line_spacing_multiplier.max(1.0));
         if at_line_start {
             draw_svg_list_marker(
                 svg,
@@ -2230,9 +2464,8 @@ fn draw_svg_list_marker(
     let x = (content_inset_doc + origin_x_doc + list_marker_x_doc(style)) * doc_to_pt;
     let y = (cursor_y_doc - marker_page_index as f32 * note.page_height_doc) * doc_to_pt
         + style.font_size * doc_to_pt * 0.62;
-    let baseline_y =
-        (cursor_y_doc - marker_page_index as f32 * note.page_height_doc) * doc_to_pt
-            + style.font_size * doc_to_pt;
+    let baseline_y = (cursor_y_doc - marker_page_index as f32 * note.page_height_doc) * doc_to_pt
+        + style.font_size * doc_to_pt;
     let radius = if decoration_style == 3 {
         (style.font_size * doc_to_pt * 0.32).max(2.2)
     } else {
@@ -2330,35 +2563,30 @@ fn draw_svg_images(
     doc_to_pt: f32,
     content_inset_doc: f32,
 ) -> Result<()> {
-    let mut media_layers = Vec::new();
-    for (image_index, media) in note
-        .media_images
-        .iter()
-        .filter(|media| media.page_index == page_index)
-        .enumerate()
-    {
-        media_layers.push((media.z_index, image_index, PageMedia::Image(media)));
-    }
-    for (sticky_index, sticky) in note
-        .sticky_notes
-        .iter()
-        .filter(|sticky| sticky.page_index == page_index)
-        .enumerate()
-    {
-        media_layers.push((
-            sticky.z_index,
-            note.media_images.len() + sticky_index,
-            PageMedia::Sticky(sticky),
-        ));
-    }
-    media_layers.sort_by_key(|(z_index, order, _)| (*z_index, *order));
-    for (_, _, layer) in media_layers {
+    let media_layers = page_media_layers(note, page_index);
+    for (index, (_, _, layer)) in media_layers.into_iter().enumerate() {
         match layer {
             PageMedia::Image(media) => {
                 draw_svg_image(svg, bundle, note, media, doc_to_pt, content_inset_doc)?
             }
             PageMedia::Sticky(sticky) => {
                 draw_svg_sticky_note(svg, sticky, doc_to_pt, content_inset_doc)?
+            }
+            PageMedia::Text(block) => {
+                let spacing = parse_line_spacing_doc(
+                    note.line_style.as_deref(),
+                    note.page_width_doc,
+                    note.layout_width_pt,
+                );
+                draw_svg_text_block(
+                    svg,
+                    note,
+                    block,
+                    index,
+                    doc_to_pt,
+                    content_inset_doc,
+                    spacing,
+                )?;
             }
         }
     }
@@ -2373,29 +2601,29 @@ fn draw_svg_image(
     doc_to_pt: f32,
     content_inset_doc: f32,
 ) -> Result<()> {
-        let path = note.bundle_root.clone() + &media.relative_path;
-        let data = read_zip_entry(bundle, &path)?;
-        let (mime_type, encoded_data) = if media.crop.is_some() {
-            let image = load_media_image(&data, media)?;
-            let mut cursor = std::io::Cursor::new(Vec::new());
-            image.write_to(&mut cursor, ImageFormat::Png)?;
-            ("image/png", cursor.into_inner())
-        } else {
-            (media_mime_type(&media.relative_path), data)
-        };
-        let x = (content_inset_doc + media.x) * doc_to_pt;
-        let y = media.y * doc_to_pt;
-        let width = media.width * doc_to_pt;
-        let height = media.height * doc_to_pt;
-        let center_x = x + width * 0.5;
-        let center_y = y + height * 0.5;
-        let scale_x = if media.flipped_horizontal { -1.0 } else { 1.0 };
-        let scale_y = if media.flipped_vertical { -1.0 } else { 1.0 };
-        let transform = if media.rotation_degrees.abs() > f32::EPSILON
-            || media.flipped_horizontal
-            || media.flipped_vertical
-        {
-            format!(
+    let path = note.bundle_root.clone() + &media.relative_path;
+    let data = read_zip_entry(bundle, &path)?;
+    let (mime_type, encoded_data) = if media.crop.is_some() {
+        let image = load_media_image(&data, media)?;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut cursor, ImageFormat::Png)?;
+        ("image/png", cursor.into_inner())
+    } else {
+        (media_mime_type(&media.relative_path), data)
+    };
+    let x = (content_inset_doc + media.x) * doc_to_pt;
+    let y = media.y * doc_to_pt;
+    let width = media.width * doc_to_pt;
+    let height = media.height * doc_to_pt;
+    let center_x = x + width * 0.5;
+    let center_y = y + height * 0.5;
+    let scale_x = if media.flipped_horizontal { -1.0 } else { 1.0 };
+    let scale_y = if media.flipped_vertical { -1.0 } else { 1.0 };
+    let transform = if media.rotation_degrees.abs() > f32::EPSILON
+        || media.flipped_horizontal
+        || media.flipped_vertical
+    {
+        format!(
                 " transform=\"translate({:.2} {:.2}) rotate({:.4}) scale({:.1} {:.1}) translate({:.2} {:.2})\"",
                 center_x,
                 center_y,
@@ -2405,23 +2633,23 @@ fn draw_svg_image(
                 -center_x,
                 -center_y
             )
-        } else {
-            String::new()
-        };
-        write!(
-            svg,
-            concat!(
-                "<image x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" ",
-                "href=\"data:{};base64,{}\" preserveAspectRatio=\"none\"{}/>"
-            ),
-            x,
-            y,
-            width,
-            height,
-            mime_type,
-            base64_encode(&encoded_data),
-            transform
-        )?;
+    } else {
+        String::new()
+    };
+    write!(
+        svg,
+        concat!(
+            "<image x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" ",
+            "href=\"data:{};base64,{}\" preserveAspectRatio=\"none\"{}/>"
+        ),
+        x,
+        y,
+        width,
+        height,
+        mime_type,
+        base64_encode(&encoded_data),
+        transform
+    )?;
     Ok(())
 }
 
@@ -2531,12 +2759,9 @@ fn draw_svg_pen_curve(
     curve: &StrokeCurve,
     doc_to_pt: f32,
     content_inset_doc: f32,
-    page_height: f32,
+    _page_height: f32,
 ) -> Result<()> {
     if curve.points.is_empty() {
-        return Ok(());
-    }
-    if is_spurious_dot(curve) {
         return Ok(());
     }
     if curve.style == STROKE_STYLE_HIGHLIGHTER
@@ -2567,7 +2792,7 @@ fn draw_svg_pen_curve(
                 "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\"{} />"
             ),
             points[0].0,
-            points[0].1.clamp(0.0, page_height),
+            points[0].1,
             radius,
             svg_rgb(curve.rgba),
             alpha,
@@ -2605,7 +2830,7 @@ fn draw_svg_pencil_curve(
         let pressure = curve.pressures.first().copied().unwrap_or(1.0);
         let frac = curve.fractional_widths.first().copied().unwrap_or(1.0);
         let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-        let alpha = pencil_alpha(curve.rgba[3], pressure);
+        let alpha = pencil_segment_alpha(curve, 0, pressure);
         write!(
             svg,
             "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\" />",
@@ -2617,7 +2842,7 @@ fn draw_svg_pencil_curve(
         )?;
         return Ok(());
     }
-    if is_bezier_point_count(points.len()) {
+    if !curve.preserve_vertices && is_bezier_point_count(points.len()) {
         let sample_count = ((points.len() - 1) / 3) + 1;
         let pressures = resample_values(&curve.pressures, sample_count);
         let fracs = resample_values(&curve.fractional_widths, sample_count);
@@ -2625,7 +2850,7 @@ fn draw_svg_pencil_curve(
             let pressure = (pressures[segment_index] + pressures[segment_index + 1]) / 2.0;
             let frac = (fracs[segment_index] + fracs[segment_index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha = pencil_alpha(curve.rgba[3], pressure);
+            let alpha = pencil_segment_alpha(curve, segment_index, pressure);
             let start = points[segment_index * 3];
             let c1 = points[segment_index * 3 + 1];
             let c2 = points[segment_index * 3 + 2];
@@ -2657,7 +2882,7 @@ fn draw_svg_pencil_curve(
             let pressure = (pressures[index] + pressures[index + 1]) / 2.0;
             let frac = (fracs[index] + fracs[index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha = pencil_alpha(curve.rgba[3], pressure);
+            let alpha = pencil_segment_alpha(curve, index, pressure);
             write!(
                 svg,
                 concat!(
@@ -2688,7 +2913,7 @@ fn draw_svg_pressure_pen_curve(
     }
     let points = stroke_points_svg(curve, doc_to_pt, content_inset_doc);
     let alpha = curve.rgba[3] as f32 / 255.0;
-    if is_bezier_point_count(points.len()) {
+    if !curve.preserve_vertices && is_bezier_point_count(points.len()) {
         let sample_count = ((points.len() - 1) / 3) + 1;
         let pressures = resample_values(&curve.pressures, sample_count);
         let fracs = resample_values(&curve.fractional_widths, sample_count);
@@ -2815,9 +3040,11 @@ fn svg_encoded_path_data(commands: &[u8], points: &[(f32, f32)]) -> String {
                 index += 1;
             }
             3 => {
-                let (Some(c1), Some(c2), Some(end)) =
-                    (points.get(index), points.get(index + 1), points.get(index + 2))
-                else {
+                let (Some(c1), Some(c2), Some(end)) = (
+                    points.get(index),
+                    points.get(index + 1),
+                    points.get(index + 2),
+                ) else {
                     return data;
                 };
                 let _ = write!(
@@ -2866,7 +3093,10 @@ fn svg_font_family(style: &TextStyle) -> &'static str {
 }
 
 fn svg_text_decoration(style: &TextStyle) -> &'static str {
-    match (style.underline, style.strikethrough || style.checklist_checked) {
+    match (
+        style.underline,
+        style.strikethrough || style.checklist_checked,
+    ) {
         (true, true) => "underline line-through",
         (true, false) => "underline",
         (false, true) => "line-through",
@@ -2967,5 +3197,130 @@ mod tests {
             height: 80.0,
         };
         assert_eq!(jpeg_crop_transform(Some(crop), 100, 80), None);
+    }
+
+    fn stroke(
+        points: Vec<(f32, f32)>,
+        preserve_vertices: bool,
+        style: u8,
+        width: f32,
+    ) -> super::StrokeCurve {
+        super::StrokeCurve {
+            page_index: 0,
+            points,
+            preserve_vertices,
+            path_commands: Vec::new(),
+            fill_path: false,
+            width,
+            rgba: [0, 0, 0, 255],
+            style,
+            dash_pattern: None,
+            pressures: vec![1.0],
+            fractional_widths: vec![1.0],
+            opacities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pencil_polygon_keeps_straight_edges_in_pdf_and_svg() {
+        let curve = stroke(
+            vec![(0.0, 0.0), (100.0, 0.0), (50.0, 100.0), (0.0, 0.0)],
+            true,
+            super::STROKE_STYLE_PENCIL,
+            2.0,
+        );
+        let mut svg = String::new();
+        super::draw_svg_pencil_curve(&mut svg, &curve, 1.0, 0.0).unwrap();
+        assert_eq!(svg.matches("<line").count(), 3);
+        assert!(!svg.contains(" C "));
+        let mut operations = Vec::new();
+        super::draw_pencil_curve(
+            &mut operations,
+            &mut lopdf::Document::new(),
+            &mut lopdf::Dictionary::new(),
+            &mut std::collections::BTreeMap::new(),
+            &curve,
+            1.0,
+            0.0,
+            200.0,
+        );
+        assert_eq!(operations.iter().filter(|op| op.operator == "l").count(), 3);
+        assert!(!operations.iter().any(|op| op.operator == "c"));
+    }
+
+    #[test]
+    fn variable_width_polygon_keeps_straight_edges() {
+        let mut curve = stroke(
+            vec![(0.0, 0.0), (100.0, 0.0), (50.0, 100.0), (0.0, 0.0)],
+            true,
+            3,
+            2.0,
+        );
+        curve.pressures = vec![0.5, 1.0, 2.0, 0.5];
+        let mut svg = String::new();
+        super::draw_svg_pressure_pen_curve(&mut svg, &curve, 1.0, 0.0).unwrap();
+        assert_eq!(svg.matches("<line").count(), 3);
+        let mut operations = Vec::new();
+        super::draw_pressure_pen_curve(
+            &mut operations,
+            &mut lopdf::Document::new(),
+            &mut lopdf::Dictionary::new(),
+            &mut std::collections::BTreeMap::new(),
+            &curve,
+            1.0,
+            0.0,
+            200.0,
+        );
+        assert_eq!(operations.iter().filter(|op| op.operator == "l").count(), 3);
+    }
+
+    #[test]
+    fn actual_pencil_cubics_remain_curved() {
+        let curve = stroke(
+            vec![(0.0, 0.0), (0.0, 100.0), (100.0, 100.0), (100.0, 0.0)],
+            false,
+            super::STROKE_STYLE_PENCIL,
+            2.0,
+        );
+        let mut svg = String::new();
+        super::draw_svg_pencil_curve(&mut svg, &curve, 1.0, 0.0).unwrap();
+        assert_eq!(svg.matches(" C ").count(), 1);
+        assert!(!svg.contains("<line"));
+    }
+
+    #[test]
+    fn small_pen_marks_and_erased_outline_fragments_are_retained() {
+        for mut curve in [
+            stroke(vec![(10.0, 10.0)], false, 3, 0.6),
+            stroke(vec![(10.0, 10.0), (10.5, 10.0)], true, 3, 0.6),
+            stroke(
+                vec![(10.0, 10.0), (11.0, 10.0), (11.0, 11.0), (10.0, 11.0)],
+                true,
+                3,
+                0.6,
+            ),
+        ] {
+            if curve.points.len() == 4 {
+                curve.fill_path = true;
+                curve.path_commands = vec![0, 1, 1, 1];
+            }
+            let mut svg = String::new();
+            super::draw_svg_pen_curve(&mut svg, &curve, 1.0, 0.0, 200.0).unwrap();
+            assert!(!svg.is_empty());
+            let mut operations = Vec::new();
+            super::draw_pen_curve(
+                &mut operations,
+                &mut lopdf::Document::new(),
+                &mut lopdf::Dictionary::new(),
+                &mut std::collections::BTreeMap::new(),
+                &curve,
+                1.0,
+                0.0,
+                200.0,
+            );
+            assert!(operations
+                .iter()
+                .any(|op| op.operator == "S" || op.operator == "f"));
+        }
     }
 }

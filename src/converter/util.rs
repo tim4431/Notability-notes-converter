@@ -78,7 +78,7 @@ pub(crate) fn choose_export_width(paper_size: Option<&str>) -> f32 {
 }
 
 pub(crate) fn page_count_for(note: &NoteDocument) -> usize {
-    let mut page_count = 1usize;
+    let mut page_count = super::render::main_text_page_count(note);
     if let Some(max_page) = note.pdf_pages.iter().map(|page| page.page_index).max() {
         page_count = page_count.max(max_page + 1);
     }

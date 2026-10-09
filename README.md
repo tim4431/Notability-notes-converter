@@ -16,6 +16,8 @@ Note: output is not perfectly identical to Notability’s official export. Some 
 
 Requirement: [Rust](https://rust-lang.org/tools/install/)
 
+SVG output with imported PDF backgrounds also needs Poppler's `pdftoppm` in `PATH`. PDF output does not need Poppler.
+
 Put your exported `.note` and `.ntb` files in `input/`, then run this from the repository root:
 
 ```bash
@@ -24,6 +26,8 @@ cargo run
 
 This converts everything under `input/` into `output/`.
 Nested folder structures are preserved.
+
+Input and output folders must be separate and must not contain each other. Files are converted in a temporary folder first. A collision or conversion failure leaves existing output unchanged. When output is replaced successfully, the previous folder is kept in a sibling backup folder. Its location is printed after conversion.
 
 Example:
 
@@ -75,6 +79,8 @@ page_index = floor(document_y / page_height)
 local_y = document_y - page_index * page_height
 ```
 
+A stroke can cross page boundaries. Keep its full path and width data on every page it reaches, then clip to each page. For cubic curves, use the curve's extrema rather than its control points to find the page range.
+
 Text appears in two forms:
 
 - `richText -> attributedString`: the main text stream
@@ -123,6 +129,8 @@ Handwriting is stored under `richText -> Handwriting Overlay -> SpatialHash`. Th
 
 Many curves are cubic Bezier chains: the point count follows `1 + 3n`, where each segment uses one start point and three more points. Pressure and fractional-width arrays may align to the Bezier sample count rather than the raw point count. A converter should preserve that pressure data for pen and pencil width/opacity.
 
+Polygon vertices can also have a `1 + 3n` point count. Keep them as straight edges, including when drawing with pencil or variable width. Small dots and short pen marks should not be discarded just because they are thin or dark.
+
 Dash and dot patterns live in `dashStyles -> objectPatterns -> <curve-index> -> pattern`. Keep the original curve index when attaching dash metadata; filtering or reordering curves too early can assign dotted styles to the wrong stroke.
 
 Grouped handwriting in `groupsArrays` has its own nested archive data plus a transform. Apply the group transform to stroke coordinates. Scale stroke width by the transform as well, otherwise grouped strokes render too thick or too thin.
@@ -154,6 +162,7 @@ A `.ntb` file is a more recent file format by Notability. It is also a ZIP archi
 The `noteBundle` stores a history of events instead of one final document object graph. Each event has an id, a type, and a payload. These event types are currently understood:
 
 - type 1: document and paper settings
+- type 7: text boundary anchors
 - type 8: text
 - type 12: character style ranges
 - type 13: paragraph and list style ranges
@@ -162,9 +171,13 @@ The `noteBundle` stores a history of events instead of one final document object
 - type 20: lists of related event ids
 - type 22: images and sticky notes
 
-Text and style data are separate events. Character and paragraph styles contain ranges into the text event, so a converter needs to apply the style events to the matching characters.
+Text and style data are separate events. Text events refer to their container by event id. Character and paragraph styles refer to text event ids and UTF-16 offsets. Resolve these references before applying styles, especially when the note has multiple text boxes. Type 7 events can provide end anchors for text ranges.
+
+Positioned text boxes store a page, position, size, and rotation. The converter keeps their text and styles separate from the main document text. It also preserves main text that continues onto later pages.
 
 Ink paths use compact binary data with half-precision or single-precision values. The payload also stores the page, origin, scale, rotation, width, color, tool, and line style. The scale applies to both the path coordinates and the stroke width.
+
+Cubic path records also contain an opacity byte. Pencil opacity varies between records, so keep it with each segment when splitting erased fragments. Use the stored opacity rather than estimating it from pressure.
 
 Shapes are separate events. Lines can have a control point, polygons use point lists, and ellipses use a bounding size. Shape events also store page, origin, rotation, width, color, tool, and dash style.
 
@@ -175,6 +188,10 @@ Partial eraser and shape eraser results are stored as breaks inside an ink path.
 Type 20 events contain lists of related event ids. They do not act as eraser masks, so their referenced ink and shapes should still be rendered.
 
 Images refer to files under `assets/` by their content hash. Their events store a MIME type, logical asset size, page, position, displayed size, rotation in radians, and an optional crop rectangle. Crop values use logical asset coordinates and do not always match the pixel dimensions of the stored image.
+
+For a bundle with one PDF asset under `assets/`, the converter uses all source pages in their original order as backgrounds, including pages without handwriting. PDF output preserves the source page content, crop, and rotation. SVG output embeds rendered backgrounds while keeping note strokes as SVG paths.
+
+Multiple PDF assets and reordered source pages still need explicit page mapping. The converter reports an error for multiple PDF assets rather than choosing one. The supplied example has no PDF backgrounds or positioned text boxes, so these paths are tested with generated fixtures.
 
 The main differences from `.note` are:
 

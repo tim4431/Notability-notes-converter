@@ -8,6 +8,10 @@ use std::fs::File;
 use std::path::Path;
 use zip::ZipArchive;
 
+mod documents;
+#[cfg(test)]
+mod fixtures;
+
 // Native NTB bundles store the note as a FlatBuffers event collection. Decode only
 // the stable fields needed by the renderer, while keeping every read bounds-checked.
 const EVENT_DOCUMENT: u8 = 1;
@@ -33,14 +37,22 @@ pub(crate) fn load_ntb_document(path: &Path) -> Result<NoteDocument> {
     let mut page_height = 891.187_56f32;
     let mut line_spacing = None;
     let mut default_style = default_text_style();
-    let mut text = String::new();
-    let mut style_events = Vec::new();
-    let mut paragraph_events = Vec::new();
     let mut media_images = Vec::new();
     let mut sticky_notes = Vec::new();
     let mut curves = Vec::new();
 
-    for (event_index, event) in events.into_iter().enumerate() {
+    // Paper settings may occur after positioned objects in an event collection.
+    let ordered_events = events
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, event)| {
+            flat.field(*event, 4).and_then(|field| flat.u8(field)) == Some(EVENT_DOCUMENT)
+        })
+        .chain(events.iter().copied().enumerate().filter(|(_, event)| {
+            flat.field(*event, 4).and_then(|field| flat.u8(field)) != Some(EVENT_DOCUMENT)
+        }));
+    for (event_index, event) in ordered_events {
         let Some(event_type) = flat.field(event, 4).and_then(|field| flat.u8(field)) else {
             continue;
         };
@@ -72,15 +84,6 @@ pub(crate) fn load_ntb_document(path: &Path) -> Result<NoteDocument> {
                         .filter(|spacing| spacing.is_finite() && *spacing > 0.0);
                 }
             }
-            EVENT_TEXT => {
-                if let Some(value) = flat.string_field(payload, 1) {
-                    text = value.to_owned();
-                }
-            }
-            EVENT_TEXT_STYLE => style_events.push(parse_text_style_event(&flat, payload)),
-            EVENT_PARAGRAPH_STYLE => {
-                paragraph_events.push(parse_paragraph_style_event(&flat, payload))
-            }
             EVENT_MEDIA => {
                 let inset = page_width * DEFAULT_CONTENT_INSET_RATIO;
                 if let Some(image) = parse_media_image(&flat, payload, event_index, inset) {
@@ -103,7 +106,13 @@ pub(crate) fn load_ntb_document(path: &Path) -> Result<NoteDocument> {
         }
     }
 
-    let text_spans = build_text_spans(&text, default_style, &style_events, &paragraph_events);
+    let (text, text_spans, text_blocks) = documents::reconstruct_text(
+        &flat,
+        &events,
+        default_style,
+        page_width * DEFAULT_CONTENT_INSET_RATIO,
+    )?;
+    let pdf_pages = documents::pdf_backgrounds(&mut bundle)?;
     let line_style = line_spacing.map(|spacing| format!("Lines:false:false:{}", spacing / 72.0));
     Ok(NoteDocument {
         bundle_root: String::new(),
@@ -115,10 +124,10 @@ pub(crate) fn load_ntb_document(path: &Path) -> Result<NoteDocument> {
         line_style,
         text,
         text_spans,
-        text_blocks: Vec::new(),
+        text_blocks,
         media_images,
         sticky_notes,
-        pdf_pages: Vec::new(),
+        pdf_pages,
         curves,
     })
 }
@@ -482,6 +491,7 @@ fn parse_ink(flat: &FlatBuffer<'_>, payload: usize, inset: f32) -> Vec<StrokeCur
                 dash_pattern: (line_style > 1).then_some(line_style - 1),
                 pressures: path.pressures,
                 fractional_widths: path.fractional_widths,
+                opacities: path.opacities,
             }
         })
         .collect()
@@ -551,6 +561,7 @@ fn parse_shape(flat: &FlatBuffer<'_>, payload: usize, inset: f32) -> Option<Stro
         dash_pattern: (dash > 1).then_some(dash - 1),
         pressures: vec![1.0; 1],
         fractional_widths: vec![1.0; 1],
+        opacities: Vec::new(),
     })
 }
 
@@ -583,6 +594,7 @@ struct DecodedInk {
     preserve_vertices: bool,
     pressures: Vec<f32>,
     fractional_widths: Vec<f32>,
+    opacities: Vec<f32>,
 }
 
 fn decode_ink_path(data: &[u8], origin: (f32, f32), scale: (f32, f32)) -> Option<Vec<DecodedInk>> {
@@ -638,6 +650,7 @@ fn decode_ink_path(data: &[u8], origin: (f32, f32), scale: (f32, f32)) -> Option
     let mut points = vec![origin];
     let mut pressures = Vec::new();
     let mut fractional_widths = Vec::new();
+    let mut opacities = Vec::new();
     for _ in 1..sample_count {
         pressures.push(read_half(data, cursor).unwrap_or(1.0));
         fractional_widths.push(read_half(data, cursor + 2).unwrap_or(1.0));
@@ -652,26 +665,30 @@ fn decode_ink_path(data: &[u8], origin: (f32, f32), scale: (f32, f32)) -> Option
             values.push(read_scalar(cursor + 7 + index * scalar_size)?);
         }
         match command {
-            0 => points.extend([
-                (
-                    origin.0 + values[0] * scale.0,
-                    origin.1 + values[1] * scale.1,
-                ),
-                (
-                    origin.0 + values[2] * scale.0,
-                    origin.1 + values[3] * scale.1,
-                ),
-                (
-                    origin.0 + values[4] * scale.0,
-                    origin.1 + values[5] * scale.1,
-                ),
-            ]),
+            0 => {
+                opacities.push(*data.get(cursor + 4)? as f32 / 255.0);
+                points.extend([
+                    (
+                        origin.0 + values[0] * scale.0,
+                        origin.1 + values[1] * scale.1,
+                    ),
+                    (
+                        origin.0 + values[2] * scale.0,
+                        origin.1 + values[3] * scale.1,
+                    ),
+                    (
+                        origin.0 + values[4] * scale.0,
+                        origin.1 + values[5] * scale.1,
+                    ),
+                ]);
+            }
             3 => {
                 push_decoded_path_with_widths(
                     &mut paths,
                     points,
                     pressures,
                     fractional_widths,
+                    opacities,
                     false,
                 );
                 points = vec![(
@@ -680,6 +697,7 @@ fn decode_ink_path(data: &[u8], origin: (f32, f32), scale: (f32, f32)) -> Option
                 )];
                 pressures = Vec::new();
                 fractional_widths = Vec::new();
+                opacities = Vec::new();
             }
             _ => unreachable!(),
         }
@@ -687,11 +705,17 @@ fn decode_ink_path(data: &[u8], origin: (f32, f32), scale: (f32, f32)) -> Option
     }
     pressures.push(read_half(data, cursor).unwrap_or(1.0));
     fractional_widths.push(read_half(data, cursor + 2).unwrap_or(1.0));
+    if sample_count == 1 {
+        if let Some(alpha) = data.get(cursor + 4) {
+            opacities.push(*alpha as f32 / 255.0);
+        }
+    }
     push_decoded_path_with_widths(
         &mut paths,
         points,
         pressures,
         fractional_widths,
+        opacities,
         sample_count == 1,
     );
     Some(paths)
@@ -709,6 +733,7 @@ fn push_decoded_path(
     paths.push(DecodedInk {
         pressures: vec![1.0; points.len()],
         fractional_widths: vec![1.0; points.len()],
+        opacities: Vec::new(),
         points,
         preserve_vertices,
     });
@@ -719,6 +744,7 @@ fn push_decoded_path_with_widths(
     points: Vec<(f32, f32)>,
     pressures: Vec<f32>,
     fractional_widths: Vec<f32>,
+    opacities: Vec<f32>,
     keep_single_point: bool,
 ) {
     if points.len() < 2 && !keep_single_point {
@@ -729,6 +755,7 @@ fn push_decoded_path_with_widths(
         preserve_vertices: false,
         pressures,
         fractional_widths,
+        opacities,
     });
 }
 
@@ -1058,5 +1085,27 @@ mod tests {
             decoded[1].points,
             vec![(10.0, 0.0), (11.0, 0.0), (12.0, 0.0), (13.0, 0.0)]
         );
+    }
+
+    #[test]
+    fn keeps_segment_opacity_with_its_erased_fragment() {
+        let mut encoded = vec![0, 4, 0, 3, 0, 0, 0, 0];
+        for (command, alpha, coordinates) in [
+            (0u8, 128u8, vec![0x3c00u16, 0, 0x4000, 0, 0x4200, 0]),
+            (3, 255, vec![0x4900, 0]),
+            (0, 64, vec![0x4980, 0, 0x4a00, 0, 0x4a80, 0]),
+        ] {
+            encoded.extend([0, 0x3c, 0, 0x3c, alpha, 0, command]);
+            for value in coordinates {
+                encoded.extend(value.to_le_bytes());
+            }
+        }
+        encoded.extend([0, 0x3c, 0, 0x3c, 255, 0]);
+        let decoded = decode_ink_path(&encoded, (0.0, 0.0), (1.0, 1.0)).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].opacities, vec![128.0 / 255.0]);
+        assert_eq!(decoded[1].opacities, vec![64.0 / 255.0]);
+        assert_eq!(decoded[0].pressures.len(), 2);
+        assert_eq!(decoded[1].pressures.len(), 2);
     }
 }

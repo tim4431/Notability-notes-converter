@@ -1,5 +1,6 @@
 mod archive;
 mod cli;
+mod geometry;
 mod model;
 mod note;
 mod ntb;

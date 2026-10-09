@@ -33,8 +33,11 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
     let rich_text = rich_text_value
         .as_dictionary()
         .ok_or("Unexpected richText object")?;
-    let reflow_state_value =
-        archive.deref(rich_text.get("reflowState").ok_or("richText has no reflowState")?);
+    let reflow_state_value = archive.deref(
+        rich_text
+            .get("reflowState")
+            .ok_or("richText has no reflowState")?,
+    );
     let reflow_state = reflow_state_value
         .as_dictionary()
         .ok_or("Unexpected reflowState object")?;
@@ -358,6 +361,11 @@ fn parse_text_blocks(
             width,
             height,
             text,
+            rotation_degrees: media
+                .get("rotationDegrees")
+                .and_then(value_f32)
+                .map(normalize_rotation_degrees)
+                .unwrap_or(0.0),
             text_spans,
             z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
         });
@@ -607,12 +615,15 @@ fn parse_curves_from_spatial_hash(
             points.push(apply_transform(point, transform));
             points_index += 2;
         }
-        let width = widths.get(curve_index).copied().unwrap_or(1.0)
-            * transform_stroke_scale(transform);
+        let width =
+            widths.get(curve_index).copied().unwrap_or(1.0) * transform_stroke_scale(transform);
         let style = styles.get(curve_index).copied().unwrap_or(3);
         let dash_pattern = dash_patterns.get(&curve_index).copied();
-        let rgba =
-            parse_handwriting_color(colors.get(curve_index * 4..curve_index * 4 + 4).unwrap_or(&[]));
+        let rgba = parse_handwriting_color(
+            colors
+                .get(curve_index * 4..curve_index * 4 + 4)
+                .unwrap_or(&[]),
+        );
         let (pressures, fractional_widths) = if use_bezier_samples {
             let sample_count = sample_counts[curve_index];
             let pressures = pressures_blob
@@ -808,27 +819,23 @@ fn parse_shape_curves_from_root(
                 .into_iter()
                 .map(|point| apply_transform(point, transform))
                 .collect();
-            let page_index = points
-                .first()
-                .map(|point| (point.1 / page_height_doc).floor() as usize)
-                .unwrap_or(0);
-            let points: Vec<(f32, f32)> = points
-                .into_iter()
-                .map(|point| localize(point, page_index, page_height_doc))
-                .collect();
-            curves.push(StrokeCurve {
-                page_index,
-                points,
-                preserve_vertices: true,
-                path_commands,
-                fill_path: true,
-                width: stroke_width,
-                rgba,
-                style,
-                dash_pattern,
-                pressures: Vec::new(),
-                fractional_widths: Vec::new(),
-            });
+            curves.extend(super::geometry::stroke_pages(
+                StrokeCurve {
+                    page_index: 0,
+                    points,
+                    preserve_vertices: true,
+                    path_commands,
+                    fill_path: true,
+                    width: stroke_width,
+                    rgba,
+                    style,
+                    dash_pattern,
+                    pressures: Vec::new(),
+                    fractional_widths: Vec::new(),
+                    opacities: Vec::new(),
+                },
+                page_height_doc,
+            ));
             continue;
         }
         let Some((points, preserve_vertices)) = parse_shape_points(kind, shape) else {
@@ -898,13 +905,13 @@ fn parse_notability_path(data: &[u8]) -> Option<(Vec<u8>, Vec<(f32, f32)>)> {
     }
     let command_count = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
     let commands = data.get(8..8 + command_count)?.to_vec();
-    let point_count = commands.iter().try_fold(0usize, |count, command| {
-        match command {
+    let point_count = commands
+        .iter()
+        .try_fold(0usize, |count, command| match command {
             0 | 1 => Some(count + 1),
             3 => Some(count + 3),
             _ => None,
-        }
-    })?;
+        })?;
     let point_bytes = data.get(8 + command_count..)?;
     if point_bytes.len() != point_count * 16 {
         return None;
@@ -972,9 +979,7 @@ fn parse_rect_points(value: &Value) -> Option<Vec<(f32, f32)>> {
 }
 
 fn close_shape_points(points: &mut Vec<(f32, f32)>, is_closed: Option<&Value>) {
-    if is_closed
-        .and_then(Value::as_boolean)
-        .unwrap_or(false)
+    if is_closed.and_then(Value::as_boolean).unwrap_or(false)
         && points
             .first()
             .zip(points.last())
@@ -1003,7 +1008,11 @@ fn circle_geometry(shape: &Dictionary) -> Option<((f32, f32), f32, f32)> {
         return Some((center, radius_x, radius_y));
     }
     let (x, y, width, height) = shape.get("rect").and_then(parse_nested_rect)?;
-    Some(((x + width * 0.5, y + height * 0.5), width * 0.5, height * 0.5))
+    Some((
+        (x + width * 0.5, y + height * 0.5),
+        width * 0.5,
+        height * 0.5,
+    ))
 }
 
 fn ellipse_bezier_points(center: (f32, f32), radius_x: f32, radius_y: f32) -> Vec<(f32, f32)> {
@@ -1070,7 +1079,10 @@ fn apply_transform(point: (f32, f32), transform: Option<[f32; 6]>) -> (f32, f32)
     let Some([a, b, c, d, tx, ty]) = transform else {
         return point;
     };
-    (a * point.0 + c * point.1 + tx, b * point.0 + d * point.1 + ty)
+    (
+        a * point.0 + c * point.1 + tx,
+        b * point.0 + d * point.1 + ty,
+    )
 }
 
 fn transform_stroke_scale(transform: Option<[f32; 6]>) -> f32 {
@@ -1101,151 +1113,23 @@ fn split_curve_into_pages(
     fractional_widths: Vec<f32>,
     page_height_doc: f32,
 ) -> Vec<StrokeCurve> {
-    if points.is_empty() {
-        return Vec::new();
-    }
-    let expected = bezier_sample_count(points.len());
-    if is_bezier_point_count(points.len())
-        && pressures.len() == expected
-        && fractional_widths.len() == expected
-    {
-        return split_bezier_curve_into_pages(
+    super::geometry::stroke_pages(
+        StrokeCurve {
+            page_index: 0,
             points,
             preserve_vertices,
+            path_commands: Vec::new(),
+            fill_path: false,
             width,
             rgba,
             style,
             dash_pattern,
             pressures,
             fractional_widths,
-            page_height_doc,
-        );
-    }
-    let mut curves = Vec::new();
-    let mut current_page = (points[0].1 / page_height_doc).floor() as usize;
-    let mut current_points = Vec::new();
-    let mut current_pressures = Vec::new();
-    let mut current_fractional = Vec::new();
-    for (index, (x, y)) in points.iter().copied().enumerate() {
-        let page_index = (y / page_height_doc).floor() as usize;
-        let local_point = (x, y - page_index as f32 * page_height_doc);
-        if page_index != current_page && !current_points.is_empty() {
-            curves.push(StrokeCurve {
-                page_index: current_page,
-                points: current_points,
-                preserve_vertices,
-                path_commands: Vec::new(),
-                fill_path: false,
-                width,
-                rgba,
-                style,
-                dash_pattern,
-                pressures: current_pressures,
-                fractional_widths: current_fractional,
-            });
-            current_points = vec![local_point];
-            current_pressures = vec![pressures.get(index).copied().unwrap_or(1.0)];
-            current_fractional = vec![fractional_widths.get(index).copied().unwrap_or(1.0)];
-            current_page = page_index;
-        } else {
-            current_points.push(local_point);
-            current_pressures.push(pressures.get(index).copied().unwrap_or(1.0));
-            current_fractional.push(fractional_widths.get(index).copied().unwrap_or(1.0));
-            current_page = page_index;
-        }
-    }
-    if !current_points.is_empty() {
-        curves.push(StrokeCurve {
-            page_index: current_page,
-            points: current_points,
-            preserve_vertices,
-            path_commands: Vec::new(),
-            fill_path: false,
-            width,
-            rgba,
-            style,
-            dash_pattern,
-            pressures: current_pressures,
-            fractional_widths: current_fractional,
-        });
-    }
-    curves
-}
-
-fn split_bezier_curve_into_pages(
-    points: Vec<(f32, f32)>,
-    preserve_vertices: bool,
-    width: f32,
-    rgba: [u8; 4],
-    style: u8,
-    dash_pattern: Option<u8>,
-    pressures: Vec<f32>,
-    fractional_widths: Vec<f32>,
-    page_height_doc: f32,
-) -> Vec<StrokeCurve> {
-    let mut curves = Vec::new();
-    let mut current_page = None;
-    let mut current_points: Vec<(f32, f32)> = Vec::new();
-    let mut current_pressures = Vec::new();
-    let mut current_fractional = Vec::new();
-    for segment_index in 0..((points.len() - 1) / 3) {
-        let start = points[segment_index * 3];
-        let c1 = points[segment_index * 3 + 1];
-        let c2 = points[segment_index * 3 + 2];
-        let end = points[segment_index * 3 + 3];
-        let page_index = (start.1 / page_height_doc).floor() as usize;
-        if current_page != Some(page_index) {
-            if let Some(page) = current_page {
-                curves.push(StrokeCurve {
-                    page_index: page,
-                    points: current_points,
-                    preserve_vertices,
-                    path_commands: Vec::new(),
-                    fill_path: false,
-                    width,
-                    rgba,
-                    style,
-                    dash_pattern,
-                    pressures: current_pressures,
-                    fractional_widths: current_fractional,
-                });
-                current_points = Vec::new();
-                current_pressures = Vec::new();
-                current_fractional = Vec::new();
-            }
-            current_page = Some(page_index);
-            current_points.push(localize(start, page_index, page_height_doc));
-            current_pressures.push(pressures[segment_index]);
-            current_fractional.push(fractional_widths[segment_index]);
-        }
-        current_points.extend([
-            localize(c1, page_index, page_height_doc),
-            localize(c2, page_index, page_height_doc),
-            localize(end, page_index, page_height_doc),
-        ]);
-        current_pressures.push(pressures[segment_index + 1]);
-        current_fractional.push(fractional_widths[segment_index + 1]);
-    }
-    if let Some(page) = current_page {
-        curves.push(StrokeCurve {
-            page_index: page,
-            points: current_points,
-            preserve_vertices,
-            path_commands: Vec::new(),
-            fill_path: false,
-            width,
-            rgba,
-            style,
-            dash_pattern,
-            pressures: current_pressures,
-            fractional_widths: current_fractional,
-        });
-    }
-    curves
-}
-
-fn localize(point: (f32, f32), page_index: usize, page_height_doc: f32) -> (f32, f32) {
-    (point.0, point.1 - page_index as f32 * page_height_doc)
+            opacities: Vec::new(),
+        },
+        page_height_doc,
+    )
 }
 
 fn bezier_sample_count(point_count: usize) -> usize {
@@ -1256,10 +1140,6 @@ fn bezier_sample_count(point_count: usize) -> usize {
     }
 }
 
-fn is_bezier_point_count(point_count: usize) -> bool {
-    point_count >= 4 && (point_count - 1) % 3 == 0
-}
-
 fn parse_handwriting_color(raw: &[u8]) -> [u8; 4] {
     if raw.len() == 4 {
         [raw[0], raw[1], raw[2], raw[3]]
@@ -1268,14 +1148,9 @@ fn parse_handwriting_color(raw: &[u8]) -> [u8; 4] {
     }
 }
 
-fn value_data<'a>(
-    archive: Option<&'a KeyedArchive>,
-    value: Option<&'a Value>,
-) -> Option<&'a [u8]> {
+fn value_data<'a>(archive: Option<&'a KeyedArchive>, value: Option<&'a Value>) -> Option<&'a [u8]> {
     let value = value?;
-    let value = archive
-        .map(|archive| archive.deref(value))
-        .unwrap_or(value);
+    let value = archive.map(|archive| archive.deref(value)).unwrap_or(value);
     value.as_data()
 }
 
@@ -1311,6 +1186,38 @@ mod tests {
     fn rejects_invalid_locked_export_width() {
         assert_eq!(locked_export_width(Some("staticWidth")), None);
         assert_eq!(locked_export_width(Some("lockedWidth:0:iPad")), None);
-        assert_eq!(locked_export_width(Some("lockedWidth:not-a-number:iPad")), None);
+        assert_eq!(
+            locked_export_width(Some("lockedWidth:not-a-number:iPad")),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_strokes_keep_their_continuation_across_page_boundaries() {
+        for (points, preserve) in [
+            (vec![(10.0, 90.0), (10.0, 110.0)], true),
+            (
+                vec![(10.0, 90.0), (10.0, 96.0), (10.0, 104.0), (10.0, 110.0)],
+                false,
+            ),
+        ] {
+            let curves = super::split_curve_into_pages(
+                points.clone(),
+                preserve,
+                1.0,
+                [0, 0, 0, 255],
+                3,
+                None,
+                vec![1.0, 1.0],
+                vec![1.0, 1.0],
+                100.0,
+            );
+            assert_eq!(curves.len(), 2);
+            assert_eq!(curves[0].points, points);
+            assert_eq!(curves[1].page_index, 1);
+            assert_eq!(curves[1].points.len(), points.len());
+            assert_eq!(curves[1].points[0], (10.0, -10.0));
+            assert_eq!(curves[1].points.last(), Some(&(10.0, 10.0)));
+        }
     }
 }
