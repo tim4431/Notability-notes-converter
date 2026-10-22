@@ -9,8 +9,11 @@ use std::path::Path;
 use zip::ZipArchive;
 
 mod documents;
+mod export;
 #[cfg(test)]
 mod fixtures;
+
+pub(crate) use export::load_ntb_export;
 
 // Native NTB bundles store the note as a FlatBuffers event collection. Decode only
 // the stable fields needed by the renderer, while keeping every read bounds-checked.

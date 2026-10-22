@@ -3,6 +3,7 @@ mod cli;
 mod geometry;
 mod model;
 mod note;
+mod note_writer;
 mod ntb;
 mod render;
 mod util;

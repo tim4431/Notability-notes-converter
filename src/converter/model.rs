@@ -13,6 +13,7 @@ pub(crate) const CURVE_SMOOTHING_TENSION: f32 = 0.8;
 pub(crate) enum OutputFormat {
     Pdf,
     Svg,
+    Note,
 }
 
 impl OutputFormat {
@@ -20,6 +21,7 @@ impl OutputFormat {
         match self {
             Self::Pdf => "pdf",
             Self::Svg => "svg",
+            Self::Note => "note",
         }
     }
 }

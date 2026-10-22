@@ -1,6 +1,6 @@
 # Notability Notes Converter
 
-Converts `.note` and `.ntb` files to `.pdf` by default, or optionally to `.svg`.
+Converts `.note` and `.ntb` files to `.pdf` by default, or optionally to `.svg`. It also converts `.ntb` files to `.note` packages.
 
 I originally made this for personal use because I couldn't find a converter online. I hope it is useful to others as well.
 
@@ -11,6 +11,7 @@ Note: output is not perfectly identical to Notability’s official export. Some 
 - Convert `.note` and `.ntb` files to other formats in bulk (high speed is a plus)
 - View `.note` and `.ntb` files on a machine that does not have Notability installed
 - Switch platforms by converting notes to `.svg` (SVGs can be imported into other note-taking apps as editable files)
+- Turn `.ntb` bundles into `.note` packages, with strokes, shapes and text kept editable
 
 ## How to use
 
@@ -47,6 +48,12 @@ Example:
 
 ```bash
 cargo run -- --format svg --input path/to/input --output path/to/output
+```
+
+`--format` is `pdf` (the default), `svg` or `note`. With `note`, `.ntb` files are converted to `.note` packages and `.note` files are copied unchanged:
+
+```bash
+cargo run -- --format note
 ```
 
 ## Analysis of the `.note` file format
@@ -122,8 +129,9 @@ Handwriting is stored under `richText -> Handwriting Overlay -> SpatialHash`. Th
 - `curvesforces`: pressure samples as `f32`
 - `curvesfractionalwidths`: width multipliers as `f32`
 - `curvescolors`: raw RGBA bytes
-- `curvesstyles`: tool/style ids
-- `dashStyles`: dash/dot pattern metadata keyed by curve index
+- `curvesstyles`: tool/style ids, one per stroke
+- `curveUUIDs`: one UUID per curve; the pieces of an erased stroke share it
+- `dashStyles`: dash/dot pattern metadata keyed by stroke index
 - `groupsArrays`: nested stroke groups with transforms
 - `shapes`: simple shape strokes
 
@@ -131,7 +139,9 @@ Many curves are cubic Bezier chains: the point count follows `1 + 3n`, where eac
 
 Polygon vertices can also have a `1 + 3n` point count. Keep them as straight edges, including when drawing with pencil or variable width. Small dots and short pen marks should not be discarded just because they are thin or dark.
 
-Dash and dot patterns live in `dashStyles -> objectPatterns -> <curve-index> -> pattern`. Keep the original curve index when attaching dash metadata; filtering or reordering curves too early can assign dotted styles to the wrong stroke.
+A stroke that the eraser split is stored as several consecutive curves with the same UUID. `curvesstyles`, `options` and the keys of `dashStyles` count these strokes, not curves: the example note has 596 curves but 149 styles. Notes that store one style per curve, or no UUIDs, count curves.
+
+Dash and dot patterns live in `dashStyles -> objectPatterns -> <stroke-index> -> pattern`. Keep the original stroke index when attaching dash metadata; filtering or reordering curves too early can assign dotted styles to the wrong stroke.
 
 Grouped handwriting in `groupsArrays` has its own nested archive data plus a transform. Apply the group transform to stroke coordinates. Scale stroke width by the transform as well, otherwise grouped strokes render too thick or too thin.
 
@@ -200,3 +210,29 @@ The main differences from `.note` are:
 - `.note` uses one continuous vertical coordinate space; `.ntb` events contain explicit page references
 - `.note` media uses paths under `Images/`; `.ntb` media uses content hashes under `assets/`
 - `.note` handwriting uses parallel binary arrays; `.ntb` stores a compact path inside each ink event
+
+## Converting `.ntb` to `.note`
+
+`--format note` writes the package that Notability 16 saves (`sessionFormatVersion` 9): `Session.plist`, `metadata.plist`, `thumb12x.png`, `Recordings/library.plist` and the media under `Images/`, `Assets/` and `PDFs/`, stored uncompressed under one folder named after the note.
+
+The example note in `input/` exists in both formats, which made the mapping checkable. Converting its `.ntb` gives back the strokes, shapes, groups, images, sticky notes and text of the `.note` copy, within the half-float precision of the bundle. Every archived object has the class names, keys and value encodings that Notability wrote.
+
+How the bundle maps to the package:
+
+- Page coordinates become `.note` document coordinates: x − `W / 38.4`, y + the top of the page. Plain pages are the bundle's page height apart; a PDF page takes `ceil(W × h / w)` of the strip.
+- An ink event becomes one stroke, and the pieces left by the eraser become consecutive curves sharing one UUID.
+- A cubic node holds the width multiplier and force as half floats, then the pencil altitude (`byte / 255 × π/2`) and azimuth (`byte / 256` of a turn). The byte the renderer reads as pencil opacity is this altitude. Nodes become `curvesfractionalwidths`, `curvesforces`, `curvesaltitudeangles` and `curvesazimuthunitvector`.
+- Tool 0 (pen) is style 3, tool 1 (pencil) style 5 and tool 2 (highlighter) style 4. Line styles 2 and 3 (dashed, dotted) are dash patterns 1 and 2.
+- Strokes, shapes and groups share one z-order, the order of their events. `shapes.indices` and each group's `index` are positions in it, and strokes fill the other positions.
+- Type 20 events list the members of a group. The members are written in document coordinates under an identity transform. Type 25 events list erased records, which are left out.
+- Shapes stay editable: lines with an optional quadratic control point, polygons named `triangle`, `square`, `rectangle` or `polygon` by their geometry, and ellipses (`circle` or `ellipse`) by their rotated frame. `rect` is the bounding box grown by half the stroke width. Pencil shapes keep their force.
+- Images keep their crop (with the crop path in `Figure.$0`), rotation, z-order and lock. A GIF keeps its animation in `Assets/<id>/media.gif` and shows a still of its first frame at the logical size.
+- Text keeps its styles, with fonts turned from a family and bold/italic flags into PostScript names, and ranges counted in UTF-16 units. Line spacing is stored in inches of an 8.5 in wide page.
+
+Limitations:
+
+- The output has not been opened in Notability yet. It mirrors Notability's own output field for field, but only the app can confirm that it imports.
+- Partially erased shapes are written as strokes with straight segments rather than as `partialshape` outlines.
+- `.ntb` bundles do not store image flips, so the converted images are not flipped.
+- Bundles with several PDFs are refused, as for PDF output. Text boxes are written without `kCanvasMediaObjectPaperAttributes`, whose values are known only for sticky notes.
+- `bezierPathsDataDictionary`, a render cache, is left empty, as Notability 15 writes it.

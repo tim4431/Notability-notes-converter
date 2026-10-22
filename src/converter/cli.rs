@@ -1,5 +1,5 @@
 use super::model::{OutputFormat, DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR};
-use super::{note, ntb, render};
+use super::{note, note_writer, ntb, render};
 use crate::Result;
 use std::collections::BTreeMap;
 use std::fs;
@@ -62,12 +62,13 @@ fn parse_format(value: &str) -> Result<OutputFormat> {
     match value {
         "pdf" => Ok(OutputFormat::Pdf),
         "svg" => Ok(OutputFormat::Svg),
-        _ => Err(format!("Unsupported format: {value}. Use pdf or svg.").into()),
+        "note" => Ok(OutputFormat::Note),
+        _ => Err(format!("Unsupported format: {value}. Use pdf, svg or note.").into()),
     }
 }
 
 fn usage_error() -> Box<dyn std::error::Error> {
-    "usage: cargo run -- [--input <path>] [--output <path>] [--format <pdf|svg>]".into()
+    "usage: cargo run -- [--input <path>] [--output <path>] [--format <pdf|svg|note>]".into()
 }
 
 fn mirror_folder(input: &Path, output: &Path, format: OutputFormat) -> Result<()> {
@@ -106,16 +107,27 @@ fn mirror_into(
         let index = count + 1;
         let target = output_path_for_source(input, output, &source, format)?;
         let relative = source.strip_prefix(input)?;
-        if is_note_source(&source) {
+        // A .note is already in the note format and is copied as is.
+        let is_target_format = format == OutputFormat::Note && has_extension(&source, "note");
+        if is_note_source(&source) && !is_target_format {
             print!("[{index}/{total}] Converting {} ... ", relative.display());
             io::stdout().flush()?;
-            let document = if has_extension(&source, "ntb") {
-                ntb::load_ntb_document(&source)?
+            if format == OutputFormat::Note {
+                let note = ntb::load_ntb_export(&source)?;
+                note_writer::write_note_bundle(&note, &target)?;
+                println!("done");
+                for warning in &note.warnings {
+                    println!("  warning: {warning}");
+                }
             } else {
-                note::load_note_document(&source)?
-            };
-            render::write_note_output(&document, &source, &target, format)?;
-            println!("done");
+                let document = if has_extension(&source, "ntb") {
+                    ntb::load_ntb_document(&source)?
+                } else {
+                    note::load_note_document(&source)?
+                };
+                render::write_note_output(&document, &source, &target, format)?;
+                println!("done");
+            }
         } else {
             print!("[{index}/{total}] Copying {} ... ", relative.display());
             io::stdout().flush()?;

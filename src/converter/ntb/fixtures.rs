@@ -1,6 +1,11 @@
 //! Small FlatBuffers/ZIP fixtures for capabilities absent from the example note.
-use super::{load_ntb_document, FlatBuffer};
-use crate::converter::{model::OutputFormat, render::write_note_output};
+use super::{load_ntb_document, load_ntb_export, FlatBuffer};
+use crate::converter::{
+    model::OutputFormat,
+    note::load_note_document,
+    note_writer::{write_note_bundle, InkObject, ShapeGeometry},
+    render::write_note_output,
+};
 use lopdf::{
     content::{Content, Operation},
     dictionary, Dictionary, Document, Stream,
@@ -46,6 +51,16 @@ impl Buffer {
         let field = FlatBuffer::new(&self.0).field(table, slot).unwrap();
         assert!(target >= field);
         self.0[field..field + 4].copy_from_slice(&((target - field) as u32).to_le_bytes());
+    }
+
+    fn vector(&mut self, length: usize, items: &[u8]) -> usize {
+        while self.0.len() % 4 != 0 {
+            self.0.push(0);
+        }
+        let offset = self.0.len();
+        self.0.extend((length as u32).to_le_bytes());
+        self.0.extend(items);
+        offset
     }
 
     fn string(&mut self, text: &str) -> usize {
@@ -187,6 +202,103 @@ fn fixture() -> Vec<u8> {
         }
     }
     b.0
+}
+
+/// A bundle of `(id, kind)` events whose payloads `payload` writes.
+fn events_bundle(
+    events: &[(u32, u8)],
+    mut payload: impl FnMut(&mut Buffer, u32) -> usize,
+) -> Vec<u8> {
+    let mut b = Buffer(vec![0; 4]);
+    let root = b.table(7, &[(6, vec![0; 4])]);
+    let vector = b.0.len();
+    b.0.extend((events.len() as u32).to_le_bytes());
+    b.0.extend(vec![0; events.len() * 4]);
+    b.link(root, 6, vector);
+    b.0[..4].copy_from_slice(&(root as u32).to_le_bytes());
+    let wrappers: Vec<usize> = events
+        .iter()
+        .map(|(index, kind)| b.table(6, &[(0, id(*index)), (4, vec![*kind]), (5, vec![0; 4])]))
+        .collect();
+    for (i, wrapper) in wrappers.iter().enumerate() {
+        let slot = vector + 4 + i * 4;
+        b.0[slot..slot + 4].copy_from_slice(&((*wrapper - slot) as u32).to_le_bytes());
+    }
+    for ((index, _), wrapper) in events.iter().zip(wrappers) {
+        let table = payload(&mut b, *index);
+        b.link(wrapper, 5, table);
+    }
+    b.0
+}
+
+fn id_list(b: &mut Buffer, table: usize, ids: &[u32]) {
+    let items: Vec<u8> = ids.iter().flat_map(|index| id(*index)).collect();
+    let vector = b.vector(ids.len(), &items);
+    b.link(table, 0, vector);
+}
+
+/// Ink on page 1, a grouped triangle, a second stroke an erase record removed, and
+/// the group of the first stroke and the triangle.
+fn ink_fixture() -> Vec<u8> {
+    events_bundle(
+        &[(0, 1), (10, 15), (11, 15), (12, 25), (13, 18), (14, 20)],
+        |b, index| match index {
+            10 | 11 => {
+                let ink = b.table(
+                    10,
+                    &[
+                        (0, position(1, 1)),
+                        (1, pair(100.0, 50.0)),
+                        (7, vec![237, 54, 36, 255]),
+                        (8, 1.5f32.to_le_bytes().to_vec()),
+                        (9, vec![0; 4]),
+                    ],
+                );
+                // Two nodes (width 0.5, force 1) around one cubic segment.
+                let mut path = vec![0, 2, 0, 3, 0, 0, 0, 0, 0x00, 0x38, 0x00, 0x3c, 255, 0, 0];
+                for value in [0x3c00u16, 0, 0x4000, 0, 0x4200, 0] {
+                    path.extend(value.to_le_bytes());
+                }
+                path.extend([0x00, 0x38, 0x00, 0x3c, 255, 0]);
+                let vector = b.vector(path.len(), &path);
+                b.link(ink, 9, vector);
+                ink
+            }
+            12 => {
+                let erase = b.table(1, &[(0, vec![0; 4])]);
+                id_list(b, erase, &[11]);
+                erase
+            }
+            13 => {
+                let shape = b.table(
+                    11,
+                    &[
+                        (0, position(1, 1)),
+                        (1, pair(200.0, 60.0)),
+                        (4, vec![2]),
+                        (5, vec![0; 4]),
+                        (9, vec![0, 0, 0, 255]),
+                        (10, 2.0f32.to_le_bytes().to_vec()),
+                    ],
+                );
+                let points = b.table(1, &[(0, vec![0; 4])]);
+                b.link(shape, 5, points);
+                let corners: Vec<u8> = [(0.0f32, 0.0f32), (30.0, 0.0), (0.0, 40.0)]
+                    .into_iter()
+                    .flat_map(|(x, y)| pair(x, y))
+                    .collect();
+                let vector = b.vector(3, &corners);
+                b.link(points, 0, vector);
+                shape
+            }
+            14 => {
+                let group = b.table(1, &[(0, vec![0; 4])]);
+                id_list(b, group, &[10, 13]);
+                group
+            }
+            _ => b.table(1, &[]),
+        },
+    )
 }
 
 struct Bundle {
@@ -469,4 +581,261 @@ fn embeds_pdf_backgrounds_in_svg_without_external_asset_links() {
     let svg = fs::read_to_string(output).unwrap();
     assert_eq!(svg.matches("data:image/png;base64,iVBOR").count(), 5);
     assert!(svg.contains("text-clip-3-0"));
+}
+
+#[test]
+fn note_export_skips_erased_records_and_keeps_groups() {
+    let bundle = Bundle::new(&ink_fixture(), &[]);
+    let export = load_ntb_export(&bundle.path).unwrap();
+    let [InkObject::Group(members)] = export.ink.as_slice() else {
+        panic!("expected one group, got {:?}", export.ink);
+    };
+    let [InkObject::Stroke(stroke), InkObject::Shape(shape)] = members.as_slice() else {
+        panic!("unexpected group members {members:?}");
+    };
+    let inset = 679.0 / 38.4;
+    let page_top = 891.187_56;
+    let first = stroke.curves[0].points[0];
+    assert!((first.0 - (100.0 - inset)).abs() < 1e-3 && (first.1 - (page_top + 50.0)).abs() < 1e-3);
+    assert_eq!(stroke.curves[0].nodes.len(), 2);
+    assert_eq!(stroke.curves[0].nodes[0].fractional_width, 0.5);
+    let ShapeGeometry::Polygon(corners) = &shape.geometry else {
+        panic!("expected a polygon");
+    };
+    assert_eq!(corners.len(), 3);
+
+    let output = bundle.directory.join("out.note");
+    write_note_bundle(&export, &output).unwrap();
+    let note = load_note_document(&output).unwrap();
+    assert_eq!(note.curves.len(), 2);
+    let ink = note
+        .curves
+        .iter()
+        .find(|curve| curve.style == 3 && curve.rgba[0] == 237)
+        .unwrap();
+    assert_eq!(ink.page_index, 1);
+    assert!((ink.points[3].0 - (103.0 - inset as f32)).abs() < 1e-3);
+    assert!((ink.points[3].1 - 50.0).abs() < 1e-3);
+    let triangle = note
+        .curves
+        .iter()
+        .find(|curve| curve.rgba == [0, 0, 0, 255])
+        .unwrap();
+    assert_eq!(triangle.points.len(), 4);
+    assert!((triangle.points[2].1 - 100.0).abs() < 1e-3);
+}
+
+#[test]
+fn note_export_places_text_boxes_on_pdf_page_slots() {
+    let bundle = Bundle::new(&fixture(), &[("assets/background.pdf", background_pdf(5))]);
+    let export = load_ntb_export(&bundle.path).unwrap();
+    assert_eq!(export.pdf_pages.len(), 5);
+    let output = bundle.directory.join("out.note");
+    write_note_bundle(&export, &output).unwrap();
+    let note = load_note_document(&output).unwrap();
+    let ntb = load_ntb_document(&bundle.path).unwrap();
+    // A 100 x 200 pt PDF page is 1358 units of the 679 wide strip.
+    assert_eq!(note.page_height_doc, 1358.0);
+    assert_eq!(note.pdf_pages.len(), 5);
+    assert!(note
+        .pdf_pages
+        .iter()
+        .enumerate()
+        .all(|(index, page)| page.page_index == index && page.source_page_index == index));
+    assert_eq!(note.text, "Main body");
+    assert_eq!(note.text_blocks.len(), ntb.text_blocks.len());
+    // Text boxes are not read back as sticky notes.
+    assert!(note.sticky_notes.is_empty());
+    for (a, b) in ntb.text_blocks.iter().zip(&note.text_blocks) {
+        assert_eq!((a.page_index, &a.text), (b.page_index, &b.text));
+        assert!((a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3);
+        let colors = |block: &crate::converter::model::TextBlock| {
+            block
+                .text_spans
+                .iter()
+                .map(|span| (span.start, span.length, span.style.color))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(colors(a), colors(b));
+    }
+    let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    let pdfs: Vec<String> = zip
+        .file_names()
+        .filter(|name| name.contains("/PDFs/") && name.ends_with(".pdf"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(pdfs.len(), 1);
+    let pdf = crate::converter::note::read_zip_entry(&mut zip, &pdfs[0]).unwrap();
+    assert_eq!(pdf, background_pdf(5));
+}
+
+#[test]
+fn an_empty_bundle_converts_to_an_empty_note() {
+    let bundle = Bundle::new(&events_bundle(&[(0, 1)], |b, _| b.table(1, &[])), &[]);
+    let export = load_ntb_export(&bundle.path).unwrap();
+    assert!(export.ink.is_empty() && export.media.is_empty() && export.text.text.is_empty());
+    assert_eq!(export.title, "fixture");
+    let output = bundle.directory.join("out.note");
+    write_note_bundle(&export, &output).unwrap();
+    let note = load_note_document(&output).unwrap();
+    assert!(note.curves.is_empty() && note.text.is_empty());
+    assert_eq!(note.page_width_doc, 679.0);
+}
+
+fn media_payload(
+    b: &mut Buffer,
+    position_xy: (f32, f32),
+    size: (f32, f32),
+    sort_key: u64,
+) -> usize {
+    b.table(
+        16,
+        &[
+            (2, position(1, 1)),
+            (3, pair(position_xy.0, position_xy.1)),
+            (6, pair(size.0, size.1)),
+            (9, sort_key.to_le_bytes().to_vec()),
+        ],
+    )
+}
+
+#[test]
+fn text_boxes_follow_their_own_events_and_erased_boxes_take_their_text() {
+    use crate::converter::note_writer::Media;
+    // Two text boxes and a sticky note share one sort key; the first box is erased.
+    let bytes = events_bundle(
+        &[
+            (0, 1),
+            (100, 22),
+            (101, 22),
+            (102, 22),
+            (110, 8),
+            (111, 8),
+            (120, 25),
+        ],
+        |b, index| match index {
+            100 => media_payload(b, (40.0, 70.0), (200.0, 100.0), 5),
+            101 => media_payload(b, (300.0, 400.0), (100.0, 50.0), 5),
+            102 => {
+                let sticky = b.table(
+                    16,
+                    &[
+                        (2, position(1, 1)),
+                        (3, pair(10.0, 10.0)),
+                        (6, pair(50.0, 50.0)),
+                        (9, 5u64.to_le_bytes().to_vec()),
+                        (15, vec![0; 4]),
+                    ],
+                );
+                let paper = b.table(5, &[(4, vec![255, 244, 142, 255])]);
+                b.link(sticky, 15, paper);
+                sticky
+            }
+            110 | 111 => {
+                let text = b.table(2, &[(0, id(index - 10)), (1, vec![0; 4])]);
+                let string = b.string(if index == 110 {
+                    "deleted box"
+                } else {
+                    "live box"
+                });
+                b.link(text, 1, string);
+                text
+            }
+            120 => {
+                let erase = b.table(1, &[(0, vec![0; 4])]);
+                id_list(b, erase, &[100]);
+                erase
+            }
+            _ => b.table(1, &[]),
+        },
+    );
+    let bundle = Bundle::new(&bytes, &[]);
+    let export = load_ntb_export(&bundle.path).unwrap();
+    let [Media::TextBox { frame, text }, Media::Sticky { .. }] = export.media.as_slice() else {
+        panic!(
+            "expected the live text box and the sticky note: {:?}",
+            export.media
+        );
+    };
+    assert_eq!(text.text, "live box");
+    assert!((frame.origin.0 - (300.0 - 679.0 / 38.4)).abs() < 1e-3);
+}
+
+#[test]
+fn a_record_stored_again_keeps_its_place_with_its_latest_content() {
+    let mut versions = 0;
+    let bytes = events_bundle(&[(0, 1), (10, 15), (11, 15), (10, 15)], |b, index| {
+        if index == 0 {
+            return b.table(1, &[]);
+        }
+        let x = match index {
+            10 => {
+                versions += 1;
+                if versions == 1 {
+                    100.0
+                } else {
+                    300.0
+                }
+            }
+            _ => 200.0,
+        };
+        let ink = b.table(
+            10,
+            &[
+                (0, position(1, 0)),
+                (1, pair(x, 50.0)),
+                (8, 1.0f32.to_le_bytes().to_vec()),
+                (9, vec![0; 4]),
+            ],
+        );
+        // A single dot.
+        let path = [0u8, 1, 0, 3, 0, 0, 0, 0, 0x00, 0x3c, 0x00, 0x3c, 255, 0];
+        let vector = b.vector(path.len(), &path);
+        b.link(ink, 9, vector);
+        ink
+    });
+    let bundle = Bundle::new(&bytes, &[]);
+    let export = load_ntb_export(&bundle.path).unwrap();
+    let starts: Vec<f32> = export
+        .ink
+        .iter()
+        .map(|object| match object {
+            InkObject::Stroke(stroke) => stroke.curves[0].points[0].0 + 679.0 / 38.4,
+            other => panic!("expected strokes, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert!((starts[0] - 300.0).abs() < 1e-3 && (starts[1] - 200.0).abs() < 1e-3);
+}
+
+#[test]
+fn reports_media_it_cannot_convert() {
+    let bytes = events_bundle(&[(0, 1), (30, 22)], |b, index| {
+        if index == 0 {
+            return b.table(1, &[]);
+        }
+        let media = b.table(
+            16,
+            &[
+                (2, position(1, 0)),
+                (3, pair(10.0, 10.0)),
+                (6, pair(50.0, 50.0)),
+                (10, vec![0; 4]),
+            ],
+        );
+        let table = b.table(2, &[(0, vec![0; 4]), (1, pair(640.0, 480.0))]);
+        b.link(media, 10, table);
+        let asset = b.table(3, &[(0, vec![0xab; 64]), (2, vec![0; 4])]);
+        b.link(table, 0, asset);
+        let mime = b.string("video/mp4");
+        b.link(asset, 2, mime);
+        media
+    });
+    let bundle = Bundle::new(&bytes, &[]);
+    let export = load_ntb_export(&bundle.path).unwrap();
+    assert!(export.media.is_empty());
+    assert_eq!(
+        export.warnings,
+        ["1 unsupported media object(s) (video/mp4) were left out"]
+    );
 }

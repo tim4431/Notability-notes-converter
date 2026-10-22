@@ -8,19 +8,19 @@ use crate::converter::model::{EmbeddedPdfPage, TextBlock};
 use crate::converter::note::read_zip_entry;
 use crate::Result;
 use lopdf::Document;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use zip::ZipArchive;
 
-type EventId = [u32; 2];
+pub(super) type EventId = [u32; 2];
 const EVENT_TEXT_BOUNDARY: u8 = 7;
 
-fn event_id(flat: &FlatBuffer<'_>, table: usize, slot: usize) -> Option<EventId> {
+pub(super) fn event_id(flat: &FlatBuffer<'_>, table: usize, slot: usize) -> Option<EventId> {
     let field = flat.field(table, slot)?;
     Some([flat.u32(field)?, flat.u32(field + 4)?])
 }
 
-fn event_type(flat: &FlatBuffer<'_>, event: usize) -> Option<u8> {
+pub(super) fn event_type(flat: &FlatBuffer<'_>, event: usize) -> Option<u8> {
     flat.field(event, 4).and_then(|field| flat.u8(field))
 }
 
@@ -64,12 +64,37 @@ fn character_offset(text: &str, utf16_offset: usize) -> usize {
     text.chars().count()
 }
 
+/// Paragraph ranges run from the newline before a paragraph to the newline ending
+/// it, whereas the paragraph is the text after each of them.
+fn past_newline(text: &str, index: usize) -> usize {
+    if text.chars().nth(index) == Some('\n') {
+        index + 1
+    } else {
+        index
+    }
+}
+
 pub(super) fn reconstruct_text(
     flat: &FlatBuffer<'_>,
     events: &[usize],
     default_style: TextStyle,
     inset: f32,
 ) -> Result<(String, Vec<TextSpan>, Vec<TextBlock>)> {
+    let (text, spans, boxes) = reconstruct_text_boxes(flat, events, default_style, inset)?;
+    Ok((
+        text,
+        spans,
+        boxes.into_iter().map(|(_, block)| block).collect(),
+    ))
+}
+
+/// The main text, and each text box with the index of its media event in `events`.
+pub(super) fn reconstruct_text_boxes(
+    flat: &FlatBuffer<'_>,
+    events: &[usize],
+    default_style: TextStyle,
+    inset: f32,
+) -> Result<(String, Vec<TextSpan>, Vec<(usize, TextBlock)>)> {
     let document_id = events
         .iter()
         .find_map(|event| {
@@ -113,7 +138,9 @@ pub(super) fn reconstruct_text(
         store.text.push_str(text);
         store.utf16_length += text.encode_utf16().count();
     }
-    // Boundary events provide end anchors such as the main text's (0, 3).
+    // Boundary events provide end anchors such as the main text's (0, 3). They mark
+    // the last character, which ranges ending there include.
+    let mut boundaries = BTreeSet::new();
     for &event in events {
         if event_type(flat, event) != Some(EVENT_TEXT_BOUNDARY) {
             continue;
@@ -126,6 +153,7 @@ pub(super) fn reconstruct_text(
             text_position(flat, payload, 0, &anchors),
         ) {
             anchors.insert(id, position);
+            boundaries.insert(id);
         }
     }
     for &event in events {
@@ -137,7 +165,12 @@ pub(super) fn reconstruct_text(
             continue;
         };
         let start = text_position(flat, payload, 0, &anchors);
-        let end = text_position(flat, payload, 1, &anchors);
+        let end = text_position(flat, payload, 1, &anchors).map(|mut end| {
+            if event_id(flat, payload, 1).is_some_and(|id| boundaries.contains(&id)) {
+                end.offset += 1;
+            }
+            end
+        });
         let Some(owner) = end.or(start).map(|position| position.owner) else {
             continue;
         };
@@ -157,8 +190,8 @@ pub(super) fn reconstruct_text(
             store.styles.push(style);
         } else {
             let mut paragraph = parse_paragraph_style_event(flat, payload);
-            paragraph.start = start;
-            paragraph.end = end;
+            paragraph.start = past_newline(&store.text, start);
+            paragraph.end = past_newline(&store.text, end);
             store.paragraphs.push(paragraph);
         }
     }
@@ -197,38 +230,49 @@ pub(super) fn reconstruct_text(
             &store.styles,
             &store.paragraphs,
         );
-        blocks.push(TextBlock {
-            page_index: page_index(flat, payload, 2),
-            x,
-            y,
-            width,
-            height,
-            rotation_degrees: rotation.to_degrees(),
-            text: store.text,
-            text_spans,
-            z_index: flat
-                .field(payload, 9)
-                .and_then(|f| flat.u64(f))
-                .and_then(|v| i64::try_from(v).ok())
-                .unwrap_or(index as i64),
-        });
+        blocks.push((
+            index,
+            TextBlock {
+                page_index: page_index(flat, payload, 2),
+                x,
+                y,
+                width,
+                height,
+                rotation_degrees: rotation.to_degrees(),
+                text: store.text,
+                text_spans,
+                z_index: flat
+                    .field(payload, 9)
+                    .and_then(|f| flat.u64(f))
+                    .and_then(|v| i64::try_from(v).ok())
+                    .unwrap_or(index as i64),
+            },
+        ));
     }
     let main = stores.remove(&document_id).unwrap_or_default();
     if stores.values().any(|store| !store.text.is_empty()) {
         return Err("NTB contains text whose container could not be resolved".into());
     }
     let spans = build_text_spans(&main.text, default_style, &main.styles, &main.paragraphs);
-    blocks.sort_by_key(|block| (block.page_index, block.z_index));
+    blocks.sort_by_key(|(_, block)| (block.page_index, block.z_index));
     Ok((main.text, spans, blocks))
 }
 
 /// A single imported PDF maps source page numbers directly to note page numbers.
 /// Preserve pages without annotations as well. Multiple assets need explicit page
 /// placement metadata; choosing an arbitrary archive entry would lose content.
+/// Some app versions keep PDFs at the top level, named by their SHA-256 hash.
 pub(super) fn pdf_backgrounds(bundle: &mut ZipArchive<File>) -> Result<Vec<EmbeddedPdfPage>> {
     let pdfs: Vec<String> = bundle
         .file_names()
-        .filter(|name| name.starts_with("assets/") && name.to_ascii_lowercase().ends_with(".pdf"))
+        .filter(|name| {
+            let name = name.to_ascii_lowercase();
+            let Some(stem) = name.strip_suffix(".pdf") else {
+                return false;
+            };
+            stem.starts_with("assets/")
+                || (stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        })
         .map(str::to_owned)
         .collect();
     if pdfs.len() > 1 {

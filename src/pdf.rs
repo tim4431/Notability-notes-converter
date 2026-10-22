@@ -46,6 +46,25 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
     ])
 }
 
+/// The visible size of a page: its crop box, turned by `/Rotate`.
+pub(crate) fn page_size(doc: &Document, zero_based_index: usize) -> Result<(f32, f32)> {
+    let page_id = page_id_by_index(doc, zero_based_index)?;
+    let [x0, y0, x1, y1] = page_box(doc, page_id)?;
+    let (width, height) = ((x1 - x0).abs(), (y1 - y0).abs());
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err("PDF page has invalid bounds".into());
+    }
+    let rotation = inherited_page_object(doc, page_id, b"Rotate")
+        .and_then(|value| value.as_i64().ok())
+        .unwrap_or(0)
+        .rem_euclid(360);
+    Ok(if matches!(rotation, 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    })
+}
+
 pub(crate) fn page_render_transform(
     doc: &Document,
     page_id: ObjectId,

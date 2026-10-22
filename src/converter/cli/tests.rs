@@ -116,3 +116,21 @@ fn rejects_nested_output_hidden_behind_a_symlink() {
     assert!(mirror_folder(&input, &alias.join("output"), OutputFormat::Pdf).is_err());
     assert!(!input.join("output").exists());
 }
+
+#[test]
+fn note_format_copies_notes_and_never_publishes_a_broken_conversion() {
+    let (_root, input, output) = fixture();
+    fs::write(input.join("kept.note"), b"already a note").unwrap();
+    mirror_folder(&input, &output, OutputFormat::Note).unwrap();
+    assert_eq!(
+        fs::read(output.join("kept.note")).unwrap(),
+        b"already a note"
+    );
+    fs::write(input.join("broken.ntb"), b"invalid ZIP").unwrap();
+    assert!(mirror_folder(&input, &output, OutputFormat::Note).is_err());
+    assert_eq!(
+        fs::read(output.join("kept.note")).unwrap(),
+        b"already a note"
+    );
+    assert!(!output.join("broken.note").exists());
+}

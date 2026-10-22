@@ -31,6 +31,7 @@ pub(crate) fn write_note_output(
     match format {
         OutputFormat::Pdf => write_lopdf_pdf(note, note_path, output_path),
         OutputFormat::Svg => write_svg(note, note_path, output_path),
+        OutputFormat::Note => Err("Notes are rendered to PDF or SVG only".into()),
     }
 }
 
