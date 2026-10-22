@@ -11,13 +11,17 @@ use lopdf::Document;
 use plist::{Dictionary, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
 pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
-    let file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(file)?;
+    read_note_document(ZipArchive::new(File::open(note_path)?)?)
+}
+
+pub(crate) fn read_note_document<R: Read + Seek>(
+    mut bundle: ZipArchive<R>,
+) -> Result<NoteDocument> {
     let entries: Vec<String> = bundle.file_names().map(str::to_owned).collect();
     let bundle_root = entries
         .iter()
@@ -103,7 +107,10 @@ fn locked_export_width(sizing_behavior: Option<&str>) -> Option<f32> {
         .filter(|width| *width > 0.0)
 }
 
-pub(crate) fn read_zip_entry(bundle: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_zip_entry<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<Vec<u8>> {
     let mut file = bundle.by_name(name)?;
     let mut data = Vec::with_capacity(file.size() as usize);
     file.read_to_end(&mut data)?;
@@ -152,15 +159,15 @@ fn choose_thumbnail_entry(entries: &[String], bundle_root: &str) -> Option<Strin
         .cloned()
 }
 
-fn thumbnail_ratio(bundle: &mut ZipArchive<File>, entry: &str) -> Result<f32> {
+fn thumbnail_ratio<R: Read + Seek>(bundle: &mut ZipArchive<R>, entry: &str) -> Result<f32> {
     let data = read_zip_entry(bundle, entry)?;
     let image = image::load_from_memory(&data)?;
     let (width, height) = image.dimensions();
     Ok(height as f32 / width as f32)
 }
 
-fn pdf_page_ratio(
-    bundle: &mut ZipArchive<File>,
+fn pdf_page_ratio<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
     bundle_root: &str,
     page: &EmbeddedPdfPage,
 ) -> Result<f32> {
@@ -177,6 +184,14 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
         .get("stringKey")
         .and_then(|value| archive.as_text(value).ok())
         .unwrap_or_default();
+    // Ranges count UTF-16 units; spans count characters.
+    let mut character_at_unit = Vec::with_capacity(text.len() + 1);
+    for (index, ch) in text.chars().enumerate() {
+        character_at_unit.extend(std::iter::repeat_n(index, ch.len_utf16()));
+    }
+    character_at_unit.push(text.chars().count());
+    let character =
+        |unit: f32| character_at_unit[(unit.max(0.0) as usize).min(character_at_unit.len() - 1)];
     let mut spans = Vec::new();
     for raw_range in archive.ns_array(attributed.get("subRangesKey")) {
         let subrange = archive.ns_dict(Some(&raw_range));
@@ -237,8 +252,8 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             != 0;
         let lower_font_name = font_name.to_ascii_lowercase();
         spans.push(TextSpan {
-            start: start as usize,
-            length: length as usize,
+            start: character(start),
+            length: character(start + length).saturating_sub(character(start)),
             style: TextStyle {
                 font_size,
                 font_name,
@@ -476,6 +491,17 @@ fn parse_sticky_notes(
         if paper_style.is_none() && paper_attrs.is_none() {
             continue;
         }
+        // Text boxes are canvases too, but draw a background only when colored.
+        let has_color = paper_style
+            .and_then(|style| style.get("paperColor"))
+            .map(|value| archive.deref(value))
+            .is_some_and(|color| {
+                color.as_dictionary().is_some()
+                    || color.as_string().is_some_and(|text| text != "$null")
+            });
+        if media.contains_key("textStore") && !has_color {
+            continue;
+        }
         let Some((x, y)) = media
             .get("documentOrigin")
             .and_then(|value| archive.as_text(value).ok())
@@ -595,6 +621,8 @@ fn parse_curves_from_spatial_hash(
     let styles = value_data(archive, spatial_hash.get("curvesstyles")).unwrap_or(&[]);
     let dash_patterns = parse_dash_patterns(archive, spatial_hash.get("dashStyles"));
     let colors = value_data(archive, spatial_hash.get("curvescolors")).unwrap_or(&[]);
+    let uuids = value_data(archive, spatial_hash.get("curveUUIDs")).unwrap_or(&[]);
+    let stroke_numbers = stroke_numbers(uuids, counts.len(), styles.len());
     let sample_counts: Vec<usize> = counts
         .iter()
         .map(|count| bezier_sample_count(*count as usize))
@@ -617,8 +645,9 @@ fn parse_curves_from_spatial_hash(
         }
         let width =
             widths.get(curve_index).copied().unwrap_or(1.0) * transform_stroke_scale(transform);
-        let style = styles.get(curve_index).copied().unwrap_or(3);
-        let dash_pattern = dash_patterns.get(&curve_index).copied();
+        let stroke = stroke_numbers[curve_index];
+        let style = styles.get(stroke).copied().unwrap_or(3);
+        let dash_pattern = dash_patterns.get(&stroke).copied();
         let rgba = parse_handwriting_color(
             colors
                 .get(curve_index * 4..curve_index * 4 + 4)
@@ -656,6 +685,28 @@ fn parse_curves_from_spatial_hash(
         ));
     }
     curves
+}
+
+/// Styles and dash patterns are numbered per stroke, and a stroke the eraser split
+/// is several consecutive curves sharing one UUID. Files that store one style per
+/// curve, or no UUIDs, number them per curve.
+fn stroke_numbers(uuids: &[u8], curve_count: usize, style_count: usize) -> Vec<usize> {
+    if uuids.len() == curve_count * 16 {
+        let mut stroke = 0;
+        let numbers: Vec<usize> = (0..curve_count)
+            .map(|index| {
+                if index > 0 && uuids[index * 16..][..16] != uuids[(index - 1) * 16..][..16] {
+                    stroke += 1;
+                }
+                stroke
+            })
+            .collect();
+        let stroke_count = numbers.last().map_or(0, |last| last + 1);
+        if style_count != curve_count || stroke_count == curve_count {
+            return numbers;
+        }
+    }
+    (0..curve_count).collect()
 }
 
 fn parse_group_curves(
@@ -890,7 +941,7 @@ fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>
             close_shape_points(&mut points, shape.get("isClosed"));
             Some((points, true))
         }
-        "circle" => {
+        "circle" | "ellipse" => {
             let (center, radius_x, radius_y) = circle_geometry(shape)?;
             Some((ellipse_bezier_points(center, radius_x, radius_y), false))
         }
@@ -1190,6 +1241,15 @@ mod tests {
             locked_export_width(Some("lockedWidth:not-a-number:iPad")),
             None
         );
+    }
+
+    #[test]
+    fn numbers_styles_per_stroke_when_erased_pieces_share_a_uuid() {
+        let uuids: Vec<u8> = [1u8, 2, 2, 3].iter().flat_map(|id| [*id; 16]).collect();
+        assert_eq!(super::stroke_numbers(&uuids, 4, 3), vec![0, 1, 1, 2]);
+        // One style per curve, or no UUIDs: per curve.
+        assert_eq!(super::stroke_numbers(&uuids, 4, 4), vec![0, 1, 2, 3]);
+        assert_eq!(super::stroke_numbers(&[], 2, 1), vec![0, 1]);
     }
 
     #[test]

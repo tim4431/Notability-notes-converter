@@ -15,3 +15,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[workspace]
+members = ["web"]
+
+# Small WebAssembly for the browser converter: `web/build.sh` builds with it.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1

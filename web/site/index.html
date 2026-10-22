@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Notability Converter</title>
+    <meta name="description" content="Convert Notability .note and .ntb files to PDF, SVG or .note in your browser. Your notes stay on your device.">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="style.css">
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Notability Converter</h1>
+        <p class="lede">
+          Convert <code>.note</code> and <code>.ntb</code> files to PDF, SVG or <code>.note</code>.
+          Everything runs in your browser: your notes are never uploaded.
+        </p>
+      </header>
+
+      <fieldset class="formats">
+        <legend>Convert to</legend>
+        <label>
+          <input type="radio" name="format" value="pdf" checked>
+          <span class="name">PDF</span>
+          <span class="hint">To read, share and print</span>
+        </label>
+        <label>
+          <input type="radio" name="format" value="svg">
+          <span class="name">SVG</span>
+          <span class="hint">Vector pages for other apps</span>
+        </label>
+        <label>
+          <input type="radio" name="format" value="note">
+          <span class="name">.note</span>
+          <span class="hint">For Notability, from <code>.ntb</code></span>
+        </label>
+      </fieldset>
+
+      <label class="drop" id="drop">
+        <input type="file" id="files" accept=".note,.ntb" multiple>
+        <span class="drop-title">Choose files or drop them here</span>
+        <span class="drop-hint"><code>.note</code> and <code>.ntb</code>, as many as you like</span>
+      </label>
+
+      <noscript><p class="message">The converter needs JavaScript.</p></noscript>
+      <p id="message" class="message" role="status" hidden></p>
+
+      <section class="results" aria-live="polite" hidden>
+        <ul id="results"></ul>
+        <div class="actions">
+          <button type="button" id="download-all">Download all (.zip)</button>
+          <button type="button" id="clear" class="secondary">Clear</button>
+        </div>
+      </section>
+
+      <footer>
+        <p>
+          Exported pages approximate Notability's own export; the
+          <a href="https://github.com/tim4431/Notability-notes-converter#readme">README</a>
+          describes what each format keeps. Source on
+          <a href="https://github.com/tim4431/Notability-notes-converter">GitHub</a>, based on
+          <a href="https://github.com/nokcha0/Notability-notes-converter">nokcha0/Notability-notes-converter</a>.
+        </p>
+      </footer>
+    </main>
+  </body>
+</html>
