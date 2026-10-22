@@ -1,0 +1,59 @@
+# Tests the converter, builds the browser version and publishes it to GitHub Pages.
+name: Web converter
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust with the WebAssembly target
+        run: |
+          rustup toolchain install 1.93.1 --profile minimal --target wasm32-unknown-unknown
+          rustup default 1.93.1
+
+      - name: Install wasm-bindgen
+        run: |
+          version=0.2.118
+          archive=wasm-bindgen-$version-x86_64-unknown-linux-musl
+          curl -sSfLO "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$version/$archive.tar.gz"
+          echo "00b519c9fc2d6e087265da1a00f29160bfcc6a823993482bc2e691910287427b  $archive.tar.gz" | sha256sum -c
+          tar -xzf "$archive.tar.gz"
+          echo "$PWD/$archive" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: cargo test
+
+      - name: Build the site
+        run: web/build.sh _site
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

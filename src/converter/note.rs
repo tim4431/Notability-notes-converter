@@ -11,13 +11,17 @@ use lopdf::Document;
 use plist::{Dictionary, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
 pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
-    let file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(file)?;
+    read_note_document(ZipArchive::new(File::open(note_path)?)?)
+}
+
+pub(crate) fn read_note_document<R: Read + Seek>(
+    mut bundle: ZipArchive<R>,
+) -> Result<NoteDocument> {
     let entries: Vec<String> = bundle.file_names().map(str::to_owned).collect();
     let bundle_root = entries
         .iter()
@@ -103,7 +107,10 @@ fn locked_export_width(sizing_behavior: Option<&str>) -> Option<f32> {
         .filter(|width| *width > 0.0)
 }
 
-pub(crate) fn read_zip_entry(bundle: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_zip_entry<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<Vec<u8>> {
     let mut file = bundle.by_name(name)?;
     let mut data = Vec::with_capacity(file.size() as usize);
     file.read_to_end(&mut data)?;
@@ -152,15 +159,15 @@ fn choose_thumbnail_entry(entries: &[String], bundle_root: &str) -> Option<Strin
         .cloned()
 }
 
-fn thumbnail_ratio(bundle: &mut ZipArchive<File>, entry: &str) -> Result<f32> {
+fn thumbnail_ratio<R: Read + Seek>(bundle: &mut ZipArchive<R>, entry: &str) -> Result<f32> {
     let data = read_zip_entry(bundle, entry)?;
     let image = image::load_from_memory(&data)?;
     let (width, height) = image.dimensions();
     Ok(height as f32 / width as f32)
 }
 
-fn pdf_page_ratio(
-    bundle: &mut ZipArchive<File>,
+fn pdf_page_ratio<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
     bundle_root: &str,
     page: &EmbeddedPdfPage,
 ) -> Result<f32> {

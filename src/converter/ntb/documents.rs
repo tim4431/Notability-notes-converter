@@ -9,7 +9,7 @@ use crate::converter::note::read_zip_entry;
 use crate::Result;
 use lopdf::Document;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::io::{Read, Seek};
 use zip::ZipArchive;
 
 pub(super) type EventId = [u32; 2];
@@ -262,7 +262,9 @@ pub(super) fn reconstruct_text_boxes(
 /// Preserve pages without annotations as well. Multiple assets need explicit page
 /// placement metadata; choosing an arbitrary archive entry would lose content.
 /// Some app versions keep PDFs at the top level, named by their SHA-256 hash.
-pub(super) fn pdf_backgrounds(bundle: &mut ZipArchive<File>) -> Result<Vec<EmbeddedPdfPage>> {
+pub(super) fn pdf_backgrounds<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
+) -> Result<Vec<EmbeddedPdfPage>> {
     let pdfs: Vec<String> = bundle
         .file_names()
         .filter(|name| {

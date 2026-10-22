@@ -10,18 +10,33 @@ pub(crate) const STROKE_STYLE_NOT_EXPORTED: u8 = 6;
 pub(crate) const CURVE_SMOOTHING_TENSION: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutputFormat {
+pub enum OutputFormat {
     Pdf,
     Svg,
     Note,
 }
 
 impl OutputFormat {
-    pub(crate) fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             Self::Pdf => "pdf",
             Self::Svg => "svg",
             Self::Note => "note",
+        }
+    }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "pdf" => Ok(Self::Pdf),
+            "svg" => Ok(Self::Svg),
+            "note" => Ok(Self::Note),
+            _ => Err(format!(
+                "Unsupported format: {value}. Use pdf, svg or note."
+            )),
         }
     }
 }

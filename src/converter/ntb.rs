@@ -5,6 +5,7 @@ use super::model::{
 use super::note::read_zip_entry;
 use crate::Result;
 use std::fs::File;
+use std::io::{Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -13,7 +14,7 @@ mod export;
 #[cfg(test)]
 mod fixtures;
 
-pub(crate) use export::load_ntb_export;
+pub(crate) use export::{load_ntb_export, read_ntb_export};
 
 // Native NTB bundles store the note as a FlatBuffers event collection. Decode only
 // the stable fields needed by the renderer, while keeping every read bounds-checked.
@@ -27,8 +28,10 @@ const EVENT_MEDIA: u8 = 22;
 const NTB_PENCIL_WIDTH_SCALE: f32 = 0.45 / 0.68;
 
 pub(crate) fn load_ntb_document(path: &Path) -> Result<NoteDocument> {
-    let file = File::open(path)?;
-    let mut bundle = ZipArchive::new(file)?;
+    read_ntb_document(ZipArchive::new(File::open(path)?)?)
+}
+
+pub(crate) fn read_ntb_document<R: Read + Seek>(mut bundle: ZipArchive<R>) -> Result<NoteDocument> {
     let bytes = read_zip_entry(&mut bundle, "noteBundle")?;
     let flat = FlatBuffer::new(&bytes);
     let root = flat.root_table().ok_or("Invalid .ntb noteBundle root")?;

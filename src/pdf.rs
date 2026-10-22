@@ -1,14 +1,14 @@
 use crate::Result;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-pub(crate) fn page_id_by_index(doc: &Document, zero_based_index: usize) -> Result<ObjectId> {
+pub fn page_id_by_index(doc: &Document, zero_based_index: usize) -> Result<ObjectId> {
     doc.get_pages()
         .get(&((zero_based_index + 1) as u32))
         .copied()
         .ok_or_else(|| format!("PDF page index {zero_based_index} not found").into())
 }
 
-pub(crate) fn add_form_xobject(
+pub fn add_form_xobject(
     output: &mut Document,
     source_doc: &Document,
     page_id: ObjectId,
@@ -30,7 +30,7 @@ pub(crate) fn add_form_xobject(
     Ok(output.add_object(stream))
 }
 
-pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
+pub fn page_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
     let object = inherited_page_object(doc, page_id, b"CropBox")
         .or_else(|| inherited_page_object(doc, page_id, b"MediaBox"))
         .ok_or("page has no MediaBox")?;

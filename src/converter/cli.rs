@@ -59,12 +59,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions> {
 }
 
 fn parse_format(value: &str) -> Result<OutputFormat> {
-    match value {
-        "pdf" => Ok(OutputFormat::Pdf),
-        "svg" => Ok(OutputFormat::Svg),
-        "note" => Ok(OutputFormat::Note),
-        _ => Err(format!("Unsupported format: {value}. Use pdf, svg or note.").into()),
-    }
+    Ok(value.parse()?)
 }
 
 fn usage_error() -> Box<dyn std::error::Error> {

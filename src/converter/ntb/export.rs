@@ -18,8 +18,9 @@ use crate::converter::note_writer::{
 };
 use crate::Result;
 use std::collections::{BTreeMap, BTreeSet};
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::FRAC_PI_2;
 use std::fs::File;
+use std::io::{Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -36,8 +37,18 @@ const STICKY_PAPER_WIDTH: f32 = 583.8;
 const MAX_PAGE_INDEX: usize = 10_000;
 
 pub(crate) fn load_ntb_export(path: &Path) -> Result<NoteExport> {
-    let file = File::open(path)?;
-    let mut bundle = ZipArchive::new(file)?;
+    let name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    read_ntb_export(ZipArchive::new(File::open(path)?)?, &name)
+}
+
+/// `name` titles the note when the bundle has no title of its own.
+pub(crate) fn read_ntb_export<R: Read + Seek>(
+    mut bundle: ZipArchive<R>,
+    name: &str,
+) -> Result<NoteExport> {
     let bytes = read_zip_entry(&mut bundle, "noteBundle")?;
     let flat = FlatBuffer::new(&bytes);
     let root = flat.root_table().ok_or("Invalid .ntb noteBundle root")?;
@@ -178,11 +189,7 @@ pub(crate) fn load_ntb_export(path: &Path) -> Result<NoteExport> {
     let title = document
         .title
         .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+        .unwrap_or_else(|| name.to_owned());
     let paper = document
         .paper
         .map(|style| document_paper(&style, page_width))
@@ -692,14 +699,18 @@ fn read_node(data: &[u8], offset: usize) -> Node {
     let altitude = data
         .get(offset + 4)
         .map(|byte| f32::from(*byte) / 255.0 * FRAC_PI_2);
+    // In double precision, so that every platform's math library rounds to the same
+    // single-precision vector.
     let azimuth = data
         .get(offset + 5)
-        .map(|byte| f32::from(*byte) * TAU / 256.0);
+        .map(|byte| f64::from(*byte) * std::f64::consts::TAU / 256.0);
     Node {
         fractional_width: finite_or(read_half(data, offset), 1.0),
         force: finite_or(read_half(data, offset + 2), 1.0),
         altitude: altitude.unwrap_or(Node::UPRIGHT.altitude),
-        azimuth: azimuth.map_or(Node::UPRIGHT.azimuth, |angle| (angle.cos(), angle.sin())),
+        azimuth: azimuth.map_or(Node::UPRIGHT.azimuth, |angle| {
+            (angle.cos() as f32, angle.sin() as f32)
+        }),
     }
 }
 
@@ -839,10 +850,10 @@ fn shape_points(geometry: &ShapeGeometry) -> Box<dyn Iterator<Item = Point> + '_
 
 /// Images, sticky notes and text boxes, in event order, with their z-order on the
 /// page from the events' sort keys.
-fn read_media<'a>(
+fn read_media<'a, R: Read + Seek>(
     flat: &FlatBuffer<'_>,
     records: impl Iterator<Item = &'a Record>,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     layout: &PageLayout,
     mut text_boxes: BTreeMap<usize, TextBlock>,
     warnings: &mut Warnings,
@@ -1009,8 +1020,8 @@ fn media_asset(flat: &FlatBuffer<'_>, payload: usize) -> Option<MediaAsset> {
 /// Assets are named by their content hash; the extension is not relied on. Images
 /// whose header cannot be read, or GIFs whose first frame cannot be decoded for the
 /// still image, are left out.
-fn read_image(
-    bundle: &mut ZipArchive<File>,
+fn read_image<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
     names: &[String],
     asset: &MediaAsset,
 ) -> Result<Option<ImageData>> {

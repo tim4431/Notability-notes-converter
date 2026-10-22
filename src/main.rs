@@ -1,9 +1,6 @@
 #[macro_use]
 extern crate lopdf;
 
-mod converter;
-mod pdf;
-
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use serde::Deserialize;
@@ -13,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-use crate::pdf::{add_form_xobject, page_box, page_id_by_index};
+use notability_converter::pdf::{add_form_xobject, page_box, page_id_by_index};
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -42,7 +39,7 @@ fn dispatch() -> Result<()> {
     if args.len() == 1 && args[0].ends_with(".json") {
         run_pdfmerge(Path::new(&args[0]))
     } else {
-        converter::run_cli(args)
+        notability_converter::run_cli(args)
     }
 }
 

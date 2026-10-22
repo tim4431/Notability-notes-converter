@@ -11,7 +11,7 @@
 use super::model::TextSpan;
 use crate::Result;
 use std::fs::File;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, Write};
 use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -215,6 +215,13 @@ pub(crate) struct RichText {
 }
 
 pub(crate) fn write_note_bundle(note: &NoteExport, output_path: &Path) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_note_bundle_to(note, File::create(output_path)?)
+}
+
+pub(crate) fn write_note_bundle_to<W: Write + Seek>(note: &NoteExport, output: W) -> Result<()> {
     let mut ids = IdSource::new(note.seed);
     let folder = bundle_folder_name(&note.title);
     let session = session::build_session(note, &folder, &mut ids)?;
@@ -222,10 +229,7 @@ pub(crate) fn write_note_bundle(note: &NoteExport, output_path: &Path) -> Result
     let thumbnail = thumbnail_png(note)?;
     let modified = zip_time(note.modified_ms.or(note.created_ms));
 
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut zip = ZipWriter::new(File::create(output_path)?);
+    let mut zip = ZipWriter::new(output);
     // Notability stores every member uncompressed, with explicit folder entries.
     let mut options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Stored)

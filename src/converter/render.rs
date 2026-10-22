@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use zip::ZipArchive;
@@ -28,19 +28,29 @@ pub(crate) fn write_note_output(
     output_path: &Path,
     format: OutputFormat,
 ) -> Result<()> {
+    let mut bundle = ZipArchive::new(File::open(note_path)?)?;
+    let output = render_note(note, &mut bundle, format)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output_path, output)?;
+    Ok(())
+}
+
+/// Renders a note; `bundle` is the package it was read from, which holds its media.
+pub(crate) fn render_note<R: Read + Seek>(
+    note: &NoteDocument,
+    bundle: &mut ZipArchive<R>,
+    format: OutputFormat,
+) -> Result<Vec<u8>> {
     match format {
-        OutputFormat::Pdf => write_lopdf_pdf(note, note_path, output_path),
-        OutputFormat::Svg => write_svg(note, note_path, output_path),
+        OutputFormat::Pdf => render_pdf(note, bundle),
+        OutputFormat::Svg => render_svg(note, bundle).map(String::into_bytes),
         OutputFormat::Note => Err("Notes are rendered to PDF or SVG only".into()),
     }
 }
 
-fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Result<()> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let source_file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(source_file)?;
+fn render_pdf<R: Read + Seek>(note: &NoteDocument, bundle: &mut ZipArchive<R>) -> Result<Vec<u8>> {
     let mut output = Document::with_version("1.5");
     let mut max_id = 1u32;
     let mut loaded_pdfs: BTreeMap<String, Document> = BTreeMap::new();
@@ -51,7 +61,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
         .map(|page| page.relative_path.clone())
         .collect::<BTreeSet<_>>()
     {
-        let data = read_zip_entry(&mut bundle, &(note.bundle_root.clone() + &relative_path))?;
+        let data = read_zip_entry(bundle, &(note.bundle_root.clone() + &relative_path))?;
         let mut doc = Document::load_mem(&data)?;
         doc.renumber_objects_with(max_id);
         max_id = doc.max_id + 1;
@@ -69,7 +79,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
     for page_index in 0..page_count {
         let page_id = write_page(
             &mut output,
-            &mut bundle,
+            bundle,
             note,
             &loaded_pdfs,
             &fonts,
@@ -96,8 +106,9 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
         output.prune_objects();
         output.renumber_objects();
     }
-    output.save(output_path)?;
-    Ok(())
+    let mut bytes = Vec::new();
+    output.save_to(&mut bytes)?;
+    Ok(bytes)
 }
 
 struct PdfFonts {
@@ -202,9 +213,9 @@ fn add_standard_fonts(output: &mut Document) -> PdfFonts {
     }
 }
 
-fn write_page(
+fn write_page<R: Read + Seek>(
     output: &mut Document,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     loaded_pdfs: &BTreeMap<String, Document>,
     fonts: &PdfFonts,
@@ -341,11 +352,11 @@ fn write_page(
     Ok(page_id)
 }
 
-fn draw_pdf_image(
+fn draw_pdf_image<R: Read + Seek>(
     operations: &mut Vec<Operation>,
     xobjects: &mut Dictionary,
     output: &mut Document,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     media: &MediaImage,
     image_cache: &mut ImageXObjectCache,
@@ -1145,9 +1156,9 @@ fn helvetica_width_factor(ch: char) -> f32 {
     }
 }
 
-fn add_image_xobject(
+fn add_image_xobject<R: Read + Seek>(
     output: &mut Document,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     media: &super::model::MediaImage,
     image_cache: &mut ImageXObjectCache,
@@ -2095,12 +2106,7 @@ fn is_bezier_point_count(point_count: usize) -> bool {
     point_count >= 4 && (point_count - 1) % 3 == 0
 }
 
-fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Result<()> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let source_file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(source_file)?;
+fn render_svg<R: Read + Seek>(note: &NoteDocument, bundle: &mut ZipArchive<R>) -> Result<String> {
     let page_count = page_count_for(note);
     let total_height = note.export_height_pt * page_count as f32;
     let doc_to_pt = note.export_width_pt / note.page_width_doc;
@@ -2114,10 +2120,7 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
     let mut pdf_assets = BTreeMap::new();
     for page in &note.pdf_pages {
         if !pdf_assets.contains_key(&page.relative_path) {
-            let data = read_zip_entry(
-                &mut bundle,
-                &(note.bundle_root.clone() + &page.relative_path),
-            )?;
+            let data = read_zip_entry(bundle, &(note.bundle_root.clone() + &page.relative_path))?;
             pdf_assets.insert(page.relative_path.clone(), data);
         }
     }
@@ -2176,7 +2179,7 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
         )?;
         draw_svg_images(
             &mut svg,
-            &mut bundle,
+            bundle,
             note,
             page_index,
             doc_to_pt,
@@ -2193,8 +2196,7 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
         svg.push_str("</g>");
     }
     svg.push_str("</svg>");
-    fs::write(output_path, svg)?;
-    Ok(())
+    Ok(svg)
 }
 
 fn draw_svg_pdf_background(
@@ -2556,9 +2558,9 @@ fn draw_svg_list_marker(
     Ok(())
 }
 
-fn draw_svg_images(
+fn draw_svg_images<R: Read + Seek>(
     svg: &mut String,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     page_index: usize,
     doc_to_pt: f32,
@@ -2594,9 +2596,9 @@ fn draw_svg_images(
     Ok(())
 }
 
-fn draw_svg_image(
+fn draw_svg_image<R: Read + Seek>(
     svg: &mut String,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     media: &MediaImage,
     doc_to_pt: f32,

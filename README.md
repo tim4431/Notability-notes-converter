@@ -2,6 +2,8 @@
 
 Converts `.note` and `.ntb` files to `.pdf` by default, or optionally to `.svg`. It also converts `.ntb` files to `.note` packages.
 
+**Online converter:** [tim4431.github.io/Notability-notes-converter](https://tim4431.github.io/Notability-notes-converter/) runs the same converter in your browser, compiled to WebAssembly. Files are converted on your device and never uploaded.
+
 I originally made this for personal use because I couldn't find a converter online. I hope it is useful to others as well.
 
 Note: output is not perfectly identical to Notability’s official export. Some details, such as Apple-specific fonts and exact text layout are approximated, but for most notes this converter works pretty well.
@@ -55,6 +57,18 @@ cargo run -- --format svg --input path/to/input --output path/to/output
 ```bash
 cargo run -- --format note
 ```
+
+## Building the online converter
+
+The browser version lives in `web/`: `web/src` exposes the converter to JavaScript, and `web/site` is the page, which converts files in a web worker. It needs Rust's WebAssembly target and [wasm-bindgen-cli](https://github.com/wasm-bindgen/wasm-bindgen) at the version of the `wasm-bindgen` crate (0.2.118):
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.118
+web/build.sh
+```
+
+This writes static files to `web/dist`; serve that folder over HTTP to try it, for example with `python3 -m http.server --directory web/dist`. The GitHub Actions workflow in `.github/workflows/pages.yml` runs the tests, builds the site and publishes it to GitHub Pages on every push to `master`.
 
 ## Analysis of the `.note` file format
 
